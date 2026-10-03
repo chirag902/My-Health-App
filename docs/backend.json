@@ -1,0 +1,54 @@
+
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "User profile information",
+      "type": "object",
+      "properties": {
+        "displayName": { "type": "string" },
+        "email": { "type": "string" },
+        "photoURL": { "type": "string" }
+      }
+    },
+    "JournalEntry": {
+      "title": "JournalEntry",
+      "description": "A private journal entry",
+      "type": "object",
+      "properties": {
+        "content": { "type": "string" },
+        "date": { "type": "string", "format": "date-time" },
+        "userId": { "type": "string" }
+      },
+      "required": ["content", "date", "userId"]
+    },
+    "Habit": {
+      "title": "Habit",
+      "description": "A tracked habit",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "completions": { "type": "array", "items": { "type": "string" } },
+        "userId": { "type": "string" }
+      },
+      "required": ["name", "completions", "userId"]
+    }
+  },
+  "auth": {
+    "providers": ["email", "google"]
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "UserProfile",
+      "description": "User profile document. Only accessible by the owner."
+    },
+    "/users/{userId}/journal/{entryId}": {
+      "schema": "JournalEntry",
+      "description": "Private journal entries. Only accessible by the owner."
+    },
+    "/users/{userId}/habits/{habitId}": {
+      "schema": "Habit",
+      "description": "Private habit tracking data. Only accessible by the owner."
+    }
+  }
+}

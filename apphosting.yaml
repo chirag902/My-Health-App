@@ -1,0 +1,16 @@
+# Settings to manage and configure a Firebase App Hosting backend.
+# https://firebase.google.com/docs/app-hosting/configure
+
+runConfig:
+  # Minimum number of instances to keep running to reduce cold starts.
+  minInstances: 0
+  # Maximum number of instances to scale up to.
+  maxInstances: 10
+  # Memory allocated to each instance.
+  memoryMiB: 512
+  # CPU count for each instance.
+  cpu: 1
+
+env:
+  - name: NODE_ENV
+    value: production

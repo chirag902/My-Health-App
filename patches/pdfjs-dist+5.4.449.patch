@@ -1,0 +1,63 @@
+diff --git a/node_modules/pdfjs-dist/package.json b/node_modules/pdfjs-dist/package.json
+index 515c895..ce73740 100644
+--- a/node_modules/pdfjs-dist/package.json
++++ b/node_modules/pdfjs-dist/package.json
+@@ -20,6 +20,11 @@
+   ],
+   "scripts": {
+     "test": "node test/test.js",
+-    "postinstall": "node install.js"
++    "postinstall": "node install.js && cp ./build/pdf.worker.js ../../public/"
+   },
+   "gitHead": "52f672322a36b35cfe90b4d41e2b5006b539a2b2"
+ }
++
+diff --git a/node_modules/pdfjs-dist/types/web/pdf_viewer.d.ts b/node_modules/pdfjs-dist/types/web/pdf_viewer.d.ts
+index e23467c..7a0fc97 100644
+--- a/node_modules/pdfjs-dist/types/web/pdf_viewer.d.ts
++++ b/node_modules/pdfjs-dist/types/web/pdf_viewer.d.ts
+@@ -10,7 +10,7 @@
+ export type PDFViewerOptions = {
+     /**
+      * - The container for the viewer element.
+      */
+-    container: HTMLDivElement;
++    container?: HTMLDivElement;
+     /**
+      * - The viewer element.
+      */
+@@ -37,7 +37,7 @@
+     enableScripting?: boolean;
+     /**
+      * - The factory that creates text layer fragments.
+      * Text layers are used for text selection and searching.
+      */
+-    textLayerFactory: import("./text_layer_builder.js").TextLayerFactory;
++    textLayerFactory?: import("./text_layer_builder.js").TextLayerFactory;
+     /**
+      * - The factory that creates annotation layer fragments.
+      * Annotation layers are used for rendering interactive forms and annotations.
+@@ -51,7 +51,7 @@
+     enableXfa?: boolean;
+     /**
+      * - The factory that creates XFA layer fragments.
+      */
+-    xfaLayerFactory: import("./xfa_layer_builder.js").XfaLayerFactory;
++    xfaLayerFactory?: import("./xfa_layer_builder.js").XfaLayerFactory;
+     /**
+      * - The maximum supported canvas size in total pixels, i.e.
+      * width * height. Use -1 for no limit. The default value is 4096 * 4096.
+      */
+diff --git a/node_modules/pdfjs-dist/types/web/ui_utils.d.ts b/node_modules/pdfjs-dist/types/web/ui_utils.d.ts
+index bf71b3e..8c94978 100644
+--- a/node_modules/pdfjs-dist/types/web/ui_utils.d.ts
++++ b/node_modules/pdfjs-dist/types/web/ui_utils.d.ts
+@@ -10,7 +10,7 @@
+      */
+     onScaleChanging?: Function;
+     /**
+-     * - The event bus to trigger events.
++     * - The event bus to trigger events. If omitted it will be created.
+      */
+     eventBus?: import("./event_utils.js").EventBus;
+     /**
