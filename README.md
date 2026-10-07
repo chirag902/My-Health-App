@@ -35,7 +35,7 @@ flowchart LR
 | Unconstrained generation paths | **45% fewer** | 10,000+ curated test cases, automated assertions plus a human feedback loop. "Failure" = answer with no supporting source. Failures fell from 1,120 to 615. |
 | Questions answered with no relevant retrieval | **20 of 100** before the fix, **7 of 100** after | n=100 queries from internal QA logs; counted by manual relevance judgment and retrieval overlap. Small sample. |
 | p95 latency | **under 800 ms** (from ~1,950 ms) | Locust, 50,000 requests, 100 concurrent users, 25% repeated queries. Measures [time to first token / full response]. Script in /load-tests. |
-| Redundant API calls | **40% fewer** | Over 30 days of logs: 200 →80  duplicate calls, counted by unique input-hash IDs. |
+| Redundant API calls | **60% fewer** | Over 30 days of logs: 200 →80  duplicate calls, counted by unique input-hash IDs. |
 
 ## What broke (and what I changed)
 
