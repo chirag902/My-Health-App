@@ -1,6 +1,9 @@
 // scripts/copy-pdf-worker.mjs
 import fs from 'fs';
 import path from 'path';
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
 
 // This script copies the pdf.worker.js file from the pdfjs-dist package to the public directory.
 // This is necessary because the worker needs to be publicly accessible for the PDF parsing to work on the client-side.
