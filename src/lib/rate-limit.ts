@@ -94,6 +94,19 @@ async function incrementInRedis(
     clearTimeout(timer);
   }
 }
+// src/lib/rate-limit.ts — add above createRateLimiter
+
+/** FNV-1a 32-bit. Dependency-free, edge-runtime safe (no node:crypto). */
+function hashKey(s: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(36);
+}
+
+const SAFE_KEY = /^[\w.:@-]*$/;
 
 export function createRateLimiter(options: RateLimiterOptions): RateLimiter {
   const {
@@ -145,7 +158,8 @@ export function createRateLimiter(options: RateLimiterOptions): RateLimiter {
     async check(rawKey: string): Promise<RateLimitResult> {
       const current = now();
       const windowIndex = Math.floor(current / windowMs);
-      const key = `${name}:${rawKey.replace(/[^\w.:@-]/g, "_").slice(0, MAX_KEY_LEN)}`;
+      const safe = SAFE_KEY.test(rawKey) && rawKey.length <= MAX_KEY_LEN;
+     const key = `${name}:${safe ? rawKey : `h${hashKey(rawKey)}`}`;
 
       if (redis) {
         try {
