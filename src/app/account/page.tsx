@@ -1,5 +1,12 @@
+import type { Metadata } from "next";
+
 import AppShell from "@/components/layout/app-shell";
 import AccountPage from "@/components/account-page";
+
+export const metadata: Metadata = {
+  title: "My Account | MyHealthApp",
+  description: "Manage your profile, settings, and account security.",
+};
 
 export default function AccountPageRoute() {
   return (
@@ -10,7 +17,6 @@ export default function AccountPageRoute() {
           Manage your profile, settings, and view your activity.
         </p>
       </div>
-
       <AccountPage />
     </AppShell>
   );

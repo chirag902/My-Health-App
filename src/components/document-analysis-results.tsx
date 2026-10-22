@@ -1,87 +1,308 @@
+"use client";
 
+import { useMemo, useState } from "react";
+import {
+  ArrowDown,
+  ArrowUp,
+  Check,
+  Eye,
+  Filter,
+  ListChecks,
+  MessageSquareQuote,
+  Minus,
+  TestTube2,
+  type LucideIcon,
+} from "lucide-react";
+
+import { Button } from "@/components/ui/button";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import {
+  asText,
+  filterPoints,
+  normalizeKeyDataPoints,
+  pluralize,
+  summarizePoints,
+  type FlagKind,
+} from "@/lib/lab-results";
 import type { AnalyzeDocumentOutput } from "@/lib/types";
-import { Badge } from "./ui/badge";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "./ui/card";
-import { ListChecks, TestTube2, MessageSquareQuote } from "lucide-react";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "./ui/table";
-import { ReactElement, JSXElementConstructor, ReactNode, ReactPortal, Key } from "react";
+
+/* ============================================================
+   STATUS CHIPS
+   Status is ALWAYS shown as text plus an icon, never by colour alone (WCAG 1.4.1).
+   Every colour pair below measures at least 8:1 in both light and dark mode.
+   ============================================================ */
+
+const FLAG_STYLES: Record<
+  FlagKind,
+  { label: string; hint: string; className: string; Icon: LucideIcon }
+> = {
+  high: {
+    label: "High",
+    hint: "above the reference range",
+    className: "bg-red-100 text-red-900 dark:bg-red-950 dark:text-red-200",
+    Icon: ArrowUp,
+  },
+  low: {
+    label: "Low",
+    hint: "below the reference range",
+    className: "bg-blue-100 text-blue-900 dark:bg-blue-950 dark:text-blue-200",
+    Icon: ArrowDown,
+  },
+  normal: {
+    label: "Normal",
+    hint: "within the reference range",
+    className: "bg-emerald-100 text-emerald-900 dark:bg-emerald-950 dark:text-emerald-200",
+    Icon: Check,
+  },
+  unknown: {
+    label: "Not compared",
+    hint: "no reference range was available to compare with",
+    className: "bg-muted text-foreground",
+    Icon: Minus,
+  },
+};
+
+function FlagBadge({ kind }: { kind: FlagKind }) {
+  const { label, hint, className, Icon } = FLAG_STYLES[kind];
+
+  return (
+    <span
+      className={`inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-xs font-semibold ${className}`}
+    >
+      <Icon className="h-3.5 w-3.5" aria-hidden="true" />
+      {label}
+      <span className="sr-only"> ({hint})</span>
+    </span>
+  );
+}
+
+function VerifyBadge() {
+  return (
+    <span
+      className="inline-flex items-center gap-1 rounded-full bg-amber-100 px-2.5 py-0.5 text-xs font-semibold text-amber-900 dark:bg-amber-950 dark:text-amber-200"
+      title="This value was hard to read. Compare it with your original report."
+    >
+      <Eye className="h-3.5 w-3.5" aria-hidden="true" />
+      Check
+      <span className="sr-only"> (hard to read: compare this value with your original report)</span>
+    </span>
+  );
+}
+
+/* ============================================================
+   HELPERS
+   ============================================================ */
+
+const MAX_SUMMARY_LENGTH = 5_000;
+
+function cleanSummary(value: unknown): string {
+  return typeof value === "string" ? value.trim().slice(0, MAX_SUMMARY_LENGTH) : "";
+}
+
+function cleanList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+
+  return value.map(asText).filter(Boolean);
+}
+
+/* ============================================================
+   COMPONENT
+   ============================================================ */
 
 interface DocumentAnalysisResultsProps {
-    result: AnalyzeDocumentOutput;
+  result: AnalyzeDocumentOutput;
 }
 
 export default function DocumentAnalysisResults({ result }: DocumentAnalysisResultsProps) {
-    const { summary, keyDataPoints, recommendations } = result;
+  const [flaggedOnly, setFlaggedOnly] = useState(false);
 
-    return (
-        <div className="space-y-6 text-sm animated-fade-in">
+  const summaryText = cleanSummary(result?.summary);
+  const recommendations = useMemo(() => cleanList(result?.recommendations), [result?.recommendations]);
 
-            <Card className="bg-primary/5">
-                <CardHeader>
-                    <CardTitle className="flex items-center gap-2 text-base">
-                         <MessageSquareQuote className="h-5 w-5 text-primary" />
-                         AI Summary
-                    </CardTitle>
-                </CardHeader>
-                <CardContent>
-                    <p className="text-foreground">{summary}</p>
-                </CardContent>
-            </Card>
+  const points = useMemo(() => normalizeKeyDataPoints(result?.keyDataPoints), [result?.keyDataPoints]);
+  const stats = useMemo(() => summarizePoints(points), [points]);
 
-            {keyDataPoints && keyDataPoints.length > 0 && (
-                <Card>
-                    <CardHeader>
-                        <CardTitle className="flex items-center gap-2 text-base">
-                            <TestTube2 className="h-5 w-5 text-primary" />
-                            Key Data Points
-                        </CardTitle>
-                        <CardDescription>
-                            The most important metrics extracted from your document.
-                        </CardDescription>
-                    </CardHeader>
-                    <CardContent>
-                        <Table>
-                             <TableHeader>
-                                <TableRow>
-                                    <TableHead>Metric</TableHead>
-                                    <TableHead>Value</TableHead>
-                                    <TableHead>Reference Range</TableHead>
-                                </TableRow>
-                            </TableHeader>
-                            <TableBody>
-                                {keyDataPoints.map((point: { metric: string; value: string; range?: string }, index: Key | null | undefined) => (
-                                    <TableRow key={index}>
-                                        <TableCell className="font-medium">{point.metric}</TableCell>
-                                        <TableCell>{point.value}</TableCell>
-                                        <TableCell className="text-muted-foreground">{point.range || 'N/A'}</TableCell>
-                                    </TableRow>
-                                ))}
-                            </TableBody>
-                        </Table>
-                    </CardContent>
-                </Card>
-            )}
+  const visiblePoints = useMemo(() => filterPoints(points, flaggedOnly), [points, flaggedOnly]);
 
-            {recommendations && recommendations.length > 0 && (
-                 <Card>
-                    <CardHeader>
-                        <CardTitle className="flex items-center gap-2 text-base">
-                           <ListChecks className="h-5 w-5 text-primary" />
-                           Recommendations
-                        </CardTitle>
-                        <CardDescription>
-                            General suggestions based on the analysis. This is not medical advice.
-                        </CardDescription>
-                    </CardHeader>
-                    <CardContent>
-                        <ul className="space-y-2 list-disc pl-5 text-muted-foreground">
-                            {recommendations.map((rec: string, index: Key | null | undefined) => (
-                                <li key={index}>{rec}</li>
-                            ))}
-                        </ul>
-                    </CardContent>
-                </Card>
-            )}
-        </div>
-    )
+  const canFilter = stats.flagged > 0 && stats.flagged < stats.total;
+
+  return (
+    <div className="animated-fade-in space-y-6 text-sm">
+      {/* ---------------- SUMMARY ---------------- */}
+      <Card className="bg-primary/5">
+        <CardHeader>
+          <CardTitle role="heading" aria-level={3} className="flex items-center gap-2 text-base">
+            <MessageSquareQuote className="h-5 w-5 text-brand" aria-hidden="true" />
+            AI Summary
+          </CardTitle>
+          <CardDescription className="text-foreground/75">
+            Generated by AI from the values below. It can make mistakes.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <p className="whitespace-pre-line break-words text-foreground">
+            {summaryText || "No summary was generated for this document."}
+          </p>
+        </CardContent>
+      </Card>
+
+      {/* ---------------- VALUES ---------------- */}
+      {points.length > 0 ? (
+        <Card>
+          <CardHeader>
+            <CardTitle role="heading" aria-level={3} className="flex items-center gap-2 text-base">
+              <TestTube2 className="h-5 w-5 text-brand" aria-hidden="true" />
+              Key Data Points
+            </CardTitle>
+            <CardDescription className="text-foreground/75">
+              Values extracted from your document, compared with the reference range printed on it.
+            </CardDescription>
+          </CardHeader>
+
+          <CardContent className="space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <p className="flex flex-wrap items-center gap-x-4 gap-y-1">
+                <span>{pluralize(stats.total, "value")} extracted</span>
+
+                {stats.high > 0 ? (
+                  <span className="font-semibold text-red-900 dark:text-red-200">
+                    {stats.high} above range
+                  </span>
+                ) : null}
+
+                {stats.low > 0 ? (
+                  <span className="font-semibold text-blue-900 dark:text-blue-200">
+                    {stats.low} below range
+                  </span>
+                ) : null}
+              </p>
+
+              {canFilter ? (
+                <Button
+                  variant={flaggedOnly ? "secondary" : "outline"}
+                  size="sm"
+                  aria-pressed={flaggedOnly}
+                  onClick={() => setFlaggedOnly((current) => !current)}
+                >
+                  <Filter className="mr-2 h-4 w-4" aria-hidden="true" />
+                  Outside range only ({stats.flagged})
+                </Button>
+              ) : null}
+            </div>
+
+            <p className="sr-only" role="status">
+              Showing {visiblePoints.length} of {stats.total} values
+            </p>
+
+            <div className="overflow-x-auto">
+              <Table className="min-w-[34rem]">
+                <caption className="sr-only">
+                  Laboratory values extracted from your document, with units, reference ranges and status
+                </caption>
+
+                <TableHeader>
+                  <TableRow>
+                    <TableHead scope="col">Metric</TableHead>
+                    <TableHead scope="col">Result</TableHead>
+                    <TableHead scope="col">Reference range</TableHead>
+                    <TableHead scope="col">Status</TableHead>
+                  </TableRow>
+                </TableHeader>
+
+                <TableBody>
+                  {visiblePoints.map((point) => (
+                    <TableRow key={point.id}>
+                      <TableCell className="font-medium">{point.metric}</TableCell>
+
+                      <TableCell>
+                        <span className={point.flag === "high" || point.flag === "low" ? "font-semibold" : undefined}>
+                          {point.value}
+                        </span>
+                        {point.unit ? <span className="ml-1 text-foreground/75">{point.unit}</span> : null}
+                      </TableCell>
+
+                      <TableCell className="text-foreground/75">
+                        {point.referenceRange ?? (
+                          <>
+                            <span aria-hidden="true">&mdash;</span>
+                            <span className="sr-only">Not stated on the report</span>
+                          </>
+                        )}
+                      </TableCell>
+
+                      <TableCell>
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <FlagBadge kind={point.flag} />
+                          {point.needsVerification ? <VerifyBadge /> : null}
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+
+            <p className="text-xs text-foreground/75">
+              Status compares each value with the reference range printed on your report. It is not a
+              diagnosis.
+              {stats.toVerify > 0
+                ? " Values marked \u201CCheck\u201D were hard to read, so compare them with your original document."
+                : ""}
+            </p>
+          </CardContent>
+        </Card>
+      ) : (
+        <Card>
+          <CardHeader>
+            <CardTitle role="heading" aria-level={3} className="flex items-center gap-2 text-base">
+              <TestTube2 className="h-5 w-5 text-brand" aria-hidden="true" />
+              Key Data Points
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-1">
+            <p className="font-medium">No laboratory values could be read from this document.</p>
+            <p className="text-foreground/75">
+              Try a clearer photo, or a PDF downloaded directly from the laboratory instead of a scan.
+            </p>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* ---------------- RECOMMENDATIONS ---------------- */}
+      {recommendations.length > 0 ? (
+        <Card>
+          <CardHeader>
+            <CardTitle role="heading" aria-level={3} className="flex items-center gap-2 text-base">
+              <ListChecks className="h-5 w-5 text-brand" aria-hidden="true" />
+              Recommendations
+            </CardTitle>
+            <CardDescription className="text-foreground/75">
+              General suggestions based on the analysis. This is not medical advice.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <ul className="list-disc space-y-2 pl-5 text-foreground/80">
+              {recommendations.map((recommendation, index) => (
+                <li key={`${index}-${recommendation.slice(0, 24)}`}>{recommendation}</li>
+              ))}
+            </ul>
+          </CardContent>
+        </Card>
+      ) : null}
+    </div>
+  );
 }

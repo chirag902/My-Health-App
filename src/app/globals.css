@@ -1,93 +1,212 @@
-@import "tailwindcss/base";
-@import "tailwindcss/components";
-@import "tailwindcss/utilities";
-
-@layer base {
-  :root {
-    --background: 220 40% 98%;
-    --foreground: 224 71.4% 4.1%;
-    --card: 220 40% 98%;
+/*
+ * Tailwind v3 (shadcn-style HSL tokens). Verify with:  npm ls tailwindcss
+ * If you are on Tailwind v4, replace these three lines with:  @import "tailwindcss";
+ */
+ @tailwind base;
+ @tailwind components;
+ @tailwind utilities;
+ 
+ @layer base {
+   :root {
+     color-scheme: light;
+ 
+     --background: 220 40% 98%;
+     --foreground: 224 71.4% 4.1%;
+     --card: 0 0% 100%;
     --card-foreground: 224 71.4% 4.1%;
-    --popover: 220 40% 98%;
+    --popover: 0 0% 100%;
     --popover-foreground: 224 71.4% 4.1%;
-    --primary: 255 100% 87%; /* Soft lavender */
-    --primary-foreground: 260 60% 20%;
-    --secondary: 210 40% 96.1%;
-    --secondary-foreground: 222.2 47.4% 11.2%;
-    --muted: 210 40% 96.1%;
-    --muted-foreground: 215.4 16.3% 46.9%;
-    --accent: 196 78% 80%; /* Pale blue */
-    --accent-foreground: 196 60% 20%;
-    --destructive: 0 84.2% 60.2%;
-    --destructive-foreground: 210 40% 98%;
-    --border: 214.3 31.8% 91.4%;
-    --input: 214.3 31.8% 91.4%;
-    --ring: 255 100% 87%;
-    --chart-1: 255 80% 70%;
-    --chart-2: 196 70% 65%;
-    --chart-3: 197 37% 24%;
-    --chart-4: 43 74% 66%;
-    --chart-5: 27 87% 67%;
-    --radius: 0.75rem;
-    --sidebar-background: 240 5% 96%;
-    --sidebar-foreground: 240 6% 10%;
-    --sidebar-primary: 255 100% 87%;
-    --sidebar-primary-foreground: 260 60% 20%;
-    --sidebar-accent: 240 5% 90%;
-    --sidebar-accent-foreground: 240 6% 10%;
-    --sidebar-border: 240 5% 85%;
-    --sidebar-ring: 255 100% 87%;
-  }
-
-  .dark {
-    --background: 240 3% 9%; /* Light gray */
-    --foreground: 210 40% 98%;
-    --card: 240 4% 12%;
-    --card-foreground: 210 40% 98%;
-    --popover: 240 4% 12%;
-    --popover-foreground: 210 40% 98%;
-    --primary: 255 100% 87%; /* Soft lavender */
-    --primary-foreground: 260 60% 20%;
-    --secondary: 240 4% 18%;
-    --secondary-foreground: 210 40% 98%;
-    --muted: 240 4% 18%;
-    --muted-foreground: 215 20.2% 65.1%;
-    --accent: 196 78% 80%; /* Pale blue */
-    --accent-foreground: 196 60% 20%;
-    --destructive: 0 62.8% 30.6%;
-    --destructive-foreground: 210 40% 98%;
-    --border: 240 4% 18%;
-    --input: 240 4% 18%;
-    --ring: 255 100% 87%;
-    --chart-1: 255 80% 70%;
-    --chart-2: 196 70% 65%;
-    --chart-3: 30 80% 55%;
-    --chart-4: 280 65% 60%;
-    --chart-5: 340 75% 55%;
-    --sidebar-background: 240 3% 9%;
-    --sidebar-foreground: 210 40% 98%;
-    --sidebar-primary: 255 100% 87%;
-    --sidebar-primary-foreground: 260 60% 20%;
-    --sidebar-accent: 240 4% 18%;
-    --sidebar-accent-foreground: 210 40% 98%;
-    --sidebar-border: 240 4% 18%;
-    --sidebar-ring: 255 100% 87%;
-  }
+ 
+     /* Soft lavender: a SURFACE color. Never use it as text/icon color on light backgrounds. */
+     --primary: 255 100% 87%;
+     --primary-foreground: 260 60% 20%;
+ 
+     --secondary: 210 40% 96.1%;
+     --secondary-foreground: 222.2 47.4% 11.2%;
+     --muted: 210 40% 96.1%;
+     --muted-foreground: 215.4 16.3% 46.9%;
+ 
+     /* Pale blue: a SURFACE color as well. */
+     --accent: 196 78% 80%;
+     --accent-foreground: 196 60% 20%;
+ 
+     --destructive: 0 84.2% 60.2%;
+     --destructive-foreground: 210 40% 98%;
+ 
+     /* Decorative dividers (cards, separators). */
+     --border: 214.3 31.8% 91.4%;
+ 
+     /* Form-control borders must reach 3:1 against the page (WCAG 1.4.11). Measured: 3.21:1. */
+     --input: 214 15% 56%;
+ 
+     /* Keyboard focus indicator. Was lavender at 1.62:1 (nearly invisible). Measured now: 7.5:1. */
+     --ring: 256 58% 48%;
+ 
+     /* Brand colors for TEXT and ICONS. Measured on the page background: 8.8:1 and 6.2:1. */
+     --brand: 256 58% 42%;
+     --brand-accent: 199 85% 30%;
+ 
+     --chart-1: 255 80% 70%;
+     --chart-2: 196 70% 65%;
+     --chart-3: 197 37% 24%;
+     --chart-4: 43 74% 66%;
+     --chart-5: 27 87% 67%;
+     --radius: 0.75rem;
+ 
+     --sidebar-background: 240 5% 96%;
+     --sidebar-foreground: 240 6% 10%;
+     --sidebar-primary: 255 100% 87%;
+     --sidebar-primary-foreground: 260 60% 20%;
+     --sidebar-accent: 240 5% 90%;
+     --sidebar-accent-foreground: 240 6% 10%;
+     --sidebar-border: 240 5% 85%;
+     --sidebar-ring: 256 58% 48%;
+   }
+ 
+   .dark {
+     color-scheme: dark;
+ 
+     --background: 240 3% 9%; /* near-black */
+     --foreground: 210 40% 98%;
+     --card: 240 4% 12%;
+     --card-foreground: 210 40% 98%;
+     --popover: 240 4% 12%;
+     --popover-foreground: 210 40% 98%;
+ 
+     --primary: 255 100% 87%;
+     --primary-foreground: 260 60% 20%;
+ 
+     --secondary: 240 4% 18%;
+     --secondary-foreground: 210 40% 98%;
+     --muted: 240 4% 18%;
+     --muted-foreground: 215 20.2% 65.1%;
+ 
+     --accent: 196 78% 80%;
+     --accent-foreground: 196 60% 20%;
+ 
+     --destructive: 0 62.8% 30.6%;
+     --destructive-foreground: 210 40% 98%;
+ 
+     --border: 240 4% 18%;
+     --input: 240 4% 42%; /* measured 3.22:1 on the dark background */
+     --ring: 255 100% 87%;
+ 
+     /* On dark, the lavender and pale blue ARE readable as text (10.6:1 and 12.4:1). */
+     --brand: 255 100% 87%;
+     --brand-accent: 196 78% 80%;
+ 
+     --chart-1: 255 80% 70%;
+     --chart-2: 196 70% 65%;
+     --chart-3: 30 80% 55%;
+     --chart-4: 280 65% 60%;
+     --chart-5: 340 75% 55%;
+ 
+     --sidebar-background: 240 3% 9%;
+     --sidebar-foreground: 210 40% 98%;
+     --sidebar-primary: 255 100% 87%;
+     --sidebar-primary-foreground: 260 60% 20%;
+     --sidebar-accent: 240 4% 18%;
+     --sidebar-accent-foreground: 210 40% 98%;
+     --sidebar-border: 240 4% 18%;
+     --sidebar-ring: 255 100% 87%;
+   }
+ 
+   /*
+    * Without these, the page ignores the theme tokens (white text on a white page in dark mode)
+    * and every border falls back to Tailwind's default gray instead of --border.
+    * Plain CSS on purpose: no dependency on tailwind.config color names.
+    */
+    * {
+      border-color: hsl(var(--border));
+    }
+  
+    html {
+      -webkit-text-size-adjust: 100%;
+      text-size-adjust: 100%;
+    }
+  
+    body {
+      background-color: hsl(var(--background));
+      color: hsl(var(--foreground));
+    }
+  
+    h1, h2, h3 {
+      text-wrap: balance;
+    }
+ }
+ p {
+  text-wrap: pretty;
 }
 
-@layer utilities {
-  .animated-fade-in {
-    animation: fadeIn 0.5s ease-in-out;
-  }
-  .animated-slide-in {
-    animation: slideIn 0.5s ease-in-out;
-  }
-  @keyframes fadeIn {
-    from { opacity: 0; }
-    to { opacity: 1; }
-  }
-  @keyframes slideIn {
-    from { transform: translateY(20px); opacity: 0; }
-    to { transform: translateY(0); opacity: 1; }
-  }
+/* ADDED: fallback for any interactive element that doesn't carry an
+   explicit focus-visible:ring-* utility (native <a>, a third-party
+   widget, anything added later and missed). Components using Tailwind's
+   ring utilities already override this per-element; this only fills
+   the gap, it doesn't double up visually where rings are already set. */
+:focus-visible {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: 2px;
 }
+ 
+ @layer utilities {
+   .text-brand {
+     color: hsl(var(--brand));
+   }
+ 
+   /* Gradient headline text. Both stops are >= 4.5:1 on the page background in light AND dark mode. */
+   .text-gradient-brand {
+     background-image: linear-gradient(90deg, hsl(var(--brand)), hsl(var(--brand-accent)));
+     -webkit-background-clip: text;
+     background-clip: text;
+     color: transparent;
+   }
+ 
+   .animated-fade-in {
+     animation: fadeIn 0.5s ease-in-out both;
+   }
+ 
+   .animated-slide-in {
+     animation: slideIn 0.5s ease-in-out both;
+   }
+   .animate-vitals-scroll {
+    animation: vitalsScroll 9s linear infinite;
+  }
+ }
+ 
+ /* Keyframes live OUTSIDE @layer so they can never be purged away. */
+ @keyframes fadeIn {
+   from {
+     opacity: 0;
+   }
+   to {
+     opacity: 1;
+   }
+ }
+ 
+ @keyframes slideIn {
+   from {
+     transform: translateY(20px);
+     opacity: 0;
+   }
+   to {
+     transform: translateY(0);
+     opacity: 1;
+   }
+ }
+ @keyframes vitalsScroll {
+  from { transform: translateX(0); }
+  to { transform: translateX(-50%); }
+}
+ 
+ /* Respect the OS "reduce motion" setting (vestibular disorders, migraines). */
+ @media (prefers-reduced-motion: reduce) {
+   *,
+   *::before,
+   *::after {
+     animation-duration: 0.01ms !important;
+     animation-iteration-count: 1 !important;
+     transition-duration: 0.01ms !important;
+     scroll-behavior: auto !important;
+   }
+   
+ }

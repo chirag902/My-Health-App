@@ -18,6 +18,7 @@ import {
 } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { getAuthErrorMessage } from "@/lib/auth-errors";
 
 export default function ForgotPasswordPage() {
   const auth = useAuth();
@@ -27,34 +28,7 @@ export default function ForgotPasswordPage() {
   const [isSending, setIsSending] = useState(false);
   const [emailSent, setEmailSent] = useState(false);
 
-  const getAuthErrorMessage = useCallback((error: unknown) => {
-    if (
-      error &&
-      typeof error === "object" &&
-      "code" in error &&
-      typeof error.code === "string"
-    ) {
-      switch (error.code) {
-        case "auth/invalid-email":
-          return "Please enter a valid email address.";
-
-        case "auth/user-not-found":
-          /*
-           * Keep the message generic rather than revealing whether
-           * an email address is registered.
-           */
-          return "If an account exists for this email, a password reset email will be sent.";
-
-        case "auth/too-many-requests":
-          return "Too many requests were made. Please wait a while and try again.";
-
-        case "auth/network-request-failed":
-          return "A network error occurred. Please check your connection and try again.";
-      }
-    }
-
-    return "Unable to send the password reset email right now. Please try again.";
-  }, []);
+  
 
   const handleSubmit = useCallback(
     async (event: React.FormEvent<HTMLFormElement>) => {

@@ -1,157 +1,211 @@
-import { createWorker, PSM } from "tesseract.js";
+// src/lib/ocr.ts  (replaces your current lib/ocr.ts; DELETE lib/ocr/extractTextFromFile.ts)
+//
+// Strategy:
+//   PDF   -> read the embedded text layer (milliseconds). No OCR needed for digital reports.
+//   Image -> auto-rotate, downscale, grayscale, then OCR with a REUSED worker.
+//
+// Setup once:
+//   npm i unpdf
+//   mkdir tessdata
+//   curl -L -o tessdata/eng.traineddata \
+//     https://github.com/tesseract-ocr/tessdata_fast/raw/main/eng.traineddata
 
-/**
- * OCR configuration for medical/laboratory documents.
- *
- * IMPORTANT:
- * - OCR extracts text.
- * - Table reconstruction is handled separately by tableParser.ts.
- * - We intentionally do not use tessedit_char_whitelist because it can
- *   remove useful characters from medical reports (e.g. :, <, >, +, °, etc.).
- */
+import os from "node:os";
+import path from "node:path";
+import sharp from "sharp";
+import { createWorker, PSM, type Worker } from "tesseract.js";
 
-const OCR_LANGUAGE = "eng";
+import { UserFacingError } from "@/lib/errors";
+import { itemsToLines, type PdfTextItem } from "@/lib/pdf-lines";
 
-/**
- * Maximum input size for OCR.
- *
- * This is a safety/performance guard rather than a hard requirement.
- * Very large images can make Tesseract extremely slow.
- */
 const MAX_DATA_URI_LENGTH = 25_000_000;
+const MAX_IMAGE_SIDE = 2000; // px. 12MP phone photo -> ~2MP = several times faster OCR
+const OCR_TIMEOUT_MS = 45_000;
+const MAX_PDF_PAGES = 10;
+const MIN_TEXT_CHARS_PER_PAGE = 40; // below this we assume the PDF is a scan
 
-/**
- * Extract text from a medical document using Tesseract OCR.
- *
- * Supported input:
- * - data:image/...;base64,...
- * - Blob/File-like URLs supported by Tesseract
- * - Other Tesseract-compatible image sources
- *
- * @param dataUri Document/image data
- * @returns Extracted OCR text
- */
-export async function extractTextFromFile(
-  dataUri: string
-): Promise<string> {
-  if (!dataUri || typeof dataUri !== "string") {
-    throw new Error("Invalid document data.");
-  }
+/* ------------------------------------------------------------
+   Reusable Tesseract worker (survives across warm invocations)
+   ------------------------------------------------------------ */
 
-  if (dataUri.length > MAX_DATA_URI_LENGTH) {
-    throw new Error(
-      "Document is too large for OCR processing. Please upload a smaller or compressed document."
-    );
-  }
+let workerPromise: Promise<Worker> | null = null;
 
-  let worker: Awaited<ReturnType<typeof createWorker>> | null = null;
+function getWorker(): Promise<Worker> {
+  if (!workerPromise) {
+    workerPromise = (async () => {
+      const worker = await createWorker("eng", 1, {
+        // Language data shipped inside the deployment: no CDN download.
+        langPath: path.join(process.cwd(), "tessdata"),
+        gzip: false,
+        // Vercel's only writable location. os.tmpdir() also works on Windows dev.
+        cachePath: os.tmpdir(),
+      });
 
-  try {
-    console.log("🔎 Starting OCR...");
+      await worker.setParameters({
+        tessedit_pageseg_mode: PSM.AUTO,
+        preserve_interword_spaces: "1",
+      });
 
-    /*
-     * Create one worker for this request.
-     *
-     * We terminate it in finally so the Node process does not retain
-     * unnecessary OCR resources after the request completes.
-     */
-    worker = await createWorker(OCR_LANGUAGE);
-
-    /*
-     * AUTO is safer for mixed medical documents because the document
-     * may contain:
-     * - headings
-     * - tables
-     * - paragraphs
-     * - numbers
-     * - reference ranges
-     *
-     * preserve_interword_spaces helps maintain spacing that the
-     * table parser can later use when reconstructing rows.
-     */
-    await worker.setParameters({
-      tessedit_pageseg_mode: PSM.AUTO,
-      preserve_interword_spaces: "1",
+      return worker;
+    })().catch((error) => {
+      workerPromise = null; // allow retry on next request
+      throw error;
     });
+  }
 
-    const result = await worker.recognize(dataUri);
+  return workerPromise;
+}
 
-    const text = result.data.text || "";
+async function resetWorker(): Promise<void> {
+  const current = workerPromise;
+  workerPromise = null;
 
-    const cleanedText = cleanOCRText(text);
-
-    console.log(
-      `✅ OCR completed. Extracted ${cleanedText.length} characters.`
-    );
-
-    return cleanedText;
-  } catch (error: unknown) {
-    const message =
-      error instanceof Error
-        ? error.message
-        : "Unknown OCR error";
-
-    console.error("❌ OCR Error:", message);
-
-    throw new Error(
-      `Failed to extract text from document: ${message}`
-    );
-  } finally {
-    /*
-     * Always release the Tesseract worker.
-     *
-     * This is important for server-side Next.js because leaving workers
-     * alive can consume memory and make repeated document uploads slower.
-     */
-    if (worker) {
-      try {
-        await worker.terminate();
-      } catch (terminateError: unknown) {
-        const message =
-          terminateError instanceof Error
-            ? terminateError.message
-            : "Unknown worker termination error";
-
-        console.error(
-          "⚠️ Failed to terminate OCR worker:",
-          message
-        );
-      }
+  if (current) {
+    try {
+      const worker = await current;
+      await worker.terminate();
+    } catch {
+      /* ignore */
     }
   }
 }
 
-/**
- * Cleans OCR output without aggressively modifying medical data.
- *
- * We deliberately avoid replacing characters such as:
- * - <
- * - >
- * - +
- * - -
- * - /
- * - %
- * - .
- *
- * because these can be clinically meaningful.
- */
-function cleanOCRText(text: string): string {
-  if (!text) {
-    return "";
+/* ------------------------------------------------------------
+   Helpers
+   ------------------------------------------------------------ */
+
+function parseDataUri(dataUri: string): { mime: string; buffer: Buffer } {
+  const comma = dataUri.indexOf(",");
+
+  if (!dataUri.startsWith("data:") || comma === -1) {
+    throw new UserFacingError("Invalid document data.");
   }
+
+  const mime = dataUri.slice(5, comma).split(";")[0].toLowerCase();
+  const buffer = Buffer.from(dataUri.slice(comma + 1), "base64");
+
+  if (buffer.length === 0) {
+    throw new UserFacingError("Invalid document data.");
+  }
+
+  return { mime, buffer };
+}
+
+async function extractPdfText(buffer: Buffer): Promise<string> {
+  const { getDocumentProxy } = await import("unpdf");
+
+  const pdf = await getDocumentProxy(new Uint8Array(buffer));
+  const pageCount = Math.min(pdf.numPages, MAX_PDF_PAGES);
+  const pages: string[] = [];
+
+  for (let i = 1; i <= pageCount; i++) {
+    const page = await pdf.getPage(i);
+    const content = await page.getTextContent();
+    pages.push(
+      itemsToLines(content.items as PdfTextItem[])
+    );
+  }
+
+  const text = pages.join("\n\n").trim();
+
+  if (text.length < MIN_TEXT_CHARS_PER_PAGE * pageCount) {
+    throw new UserFacingError(
+      "This PDF looks like a scan (no selectable text). Please upload a clear photo or screenshot (JPG/PNG) of the report instead."
+    );
+    // NEXT STEP if you want scanned PDFs: rasterize pages with unpdf's
+    // renderPageAsImage + @napi-rs/canvas, then feed them to recognizeImage().
+  }
+
+  return text;
+}
+
+async function preprocessImage(buffer: Buffer): Promise<Buffer> {
+  return sharp(buffer)
+    .rotate() // honour EXIF orientation (phone photos!)
+    .resize({
+      width: MAX_IMAGE_SIDE,
+      height: MAX_IMAGE_SIDE,
+      fit: "inside",
+      withoutEnlargement: true,
+    })
+    .grayscale()
+    .normalize()
+    .png()
+    .toBuffer();
+}
+
+async function recognizeImage(image: Buffer): Promise<string> {
+  const worker = await getWorker();
+
+  let timer: NodeJS.Timeout | undefined;
+
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new UserFacingError("OCR timed out. Try a smaller or clearer image.")),
+      OCR_TIMEOUT_MS
+    );
+  });
+
+  try {
+    const { data } = await Promise.race([worker.recognize(image), timeout]);
+    return data.text || "";
+  } catch (error) {
+    await resetWorker(); // a stuck worker must not poison later requests
+    throw error;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/* ------------------------------------------------------------
+   Public API (same signature as before)
+   ------------------------------------------------------------ */
+
+export async function extractTextFromFile(dataUri: string): Promise<string> {
+  if (!dataUri || typeof dataUri !== "string") {
+    throw new UserFacingError("Invalid document data.");
+  }
+
+  if (dataUri.length > MAX_DATA_URI_LENGTH) {
+    throw new UserFacingError("Document is too large. Please upload a smaller file.");
+  }
+
+  const started = Date.now();
+  const { mime, buffer } = parseDataUri(dataUri);
+
+  let text: string;
+
+  if (mime === "application/pdf") {
+    text = await extractPdfText(buffer);
+  } else if (mime.startsWith("image/")) {
+    let prepared: Buffer;
+    try {
+      prepared = await preprocessImage(buffer);
+    } catch {
+      throw new UserFacingError(
+        "This image could not be read. Please upload a clear JPG, PNG or WebP."
+      );
+    }
+    text = await recognizeImage(prepared);
+  } else {
+    throw new UserFacingError("Unsupported document type.");
+  }
+
+  console.log(
+    `[ocr] ${mime} -> ${text.length} chars in ${Date.now() - started}ms`
+  );
+
+  return cleanOCRText(text);
+}
+
+function cleanOCRText(text: string): string {
+  if (!text) return "";
 
   return text
     .replace(/\r\n/g, "\n")
     .replace(/\r/g, "\n")
-
-    // Normalize tabs but preserve line structure.
     .replace(/\t+/g, "\t")
-
-    // Remove excessive spaces while preserving meaningful spacing.
     .replace(/[ ]{3,}/g, "  ")
-
-    // Prevent huge runs of blank lines.
     .replace(/\n{3,}/g, "\n\n")
-
     .trim();
 }

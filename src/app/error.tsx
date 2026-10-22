@@ -1,91 +1,48 @@
-
 "use client";
 
 import { useEffect } from "react";
-import { useRouter } from "next/navigation";
-import { AlertCircle, RefreshCcw } from "lucide-react";
-
-import { logger } from "@/lib/logger";
-
-import {
-  Card,
-  CardContent,
-  CardFooter,
-  CardHeader,
-  CardTitle,
-  CardDescription,
-} from "@/components/ui/card";
+import Link from "next/link";
 
 import { Button } from "@/components/ui/button";
+import { logger } from "@/lib/logger";
 
-export default function Error({
+/**
+ * Catches errors thrown while rendering any route segment.
+ * The component is deliberately NOT called `Error`, which would shadow the global type.
+ */
+export default function RouteError({
   error,
   reset,
 }: {
   error: Error & { digest?: string };
   reset: () => void;
 }) {
-  const router = useRouter();
-
   useEffect(() => {
-    logger.error("Uncaught application error", {
-      digest: error.digest,
-      name: error.name,
-    });
+    // Never log or show error.message here: it can contain user data or internals.
+    logger.error("Unhandled route error", { name: error.name, digest: error.digest });
   }, [error]);
 
-  const handleGoHome = () => {
-    router.replace("/");
-  };
-
   return (
-    <main className="flex min-h-screen items-center justify-center bg-background p-4">
-      <Card className="w-full max-w-md shadow-lg">
-        <CardHeader>
-          <div
-            className="mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-destructive/10"
-            aria-hidden="true"
-          >
-            <AlertCircle className="h-6 w-6 text-destructive" />
-          </div>
+    <main
+      id="main-content"
+      className="flex min-h-[70vh] flex-col items-center justify-center gap-4 px-4 text-center"
+    >
+      <h1 className="text-3xl font-bold tracking-tight md:text-4xl">Something went wrong</h1>
+      <p className="max-w-md text-muted-foreground">
+        An unexpected error occurred. Please try again. If it keeps happening, come back in a few
+        minutes.
+      </p>
 
-          <CardTitle className="text-2xl">
-            Something went wrong
-          </CardTitle>
+      {error.digest ? (
+        <p className="text-xs text-muted-foreground">Reference: {error.digest}</p>
+      ) : null}
 
-          <CardDescription>
-            We couldn't load this page correctly. Please try again or return
-            to the home page.
-          </CardDescription>
-        </CardHeader>
-
-        <CardContent>
-          <p className="text-sm text-muted-foreground">
-            Your data has not been intentionally changed by this error.
-            Please try again before continuing.
-          </p>
-        </CardContent>
-
-        <CardFooter className="flex gap-3">
-          <Button
-            type="button"
-            onClick={reset}
-            className="flex-1"
-          >
-            <RefreshCcw className="mr-2 h-4 w-4" />
-            Try Again
-          </Button>
-
-          <Button
-            type="button"
-            variant="outline"
-            onClick={handleGoHome}
-            className="flex-1"
-          >
-            Go Home
-          </Button>
-        </CardFooter>
-      </Card>
+      <div className="flex gap-2">
+        <Button onClick={reset}>Try again</Button>
+        <Button asChild variant="outline">
+          <Link href="/">Go home</Link>
+        </Button>
+      </div>
     </main>
   );
 }

@@ -1,47 +1,24 @@
 // src/lib/ocr/tableParser.ts
 
 /**
- * Medical Laboratory Table Parser
+ * Medical laboratory table parser.
  *
- * Purpose:
- * - Convert OCR text into structured laboratory metrics.
- * - Handle imperfect OCR/table alignment.
- * - Preserve numeric results when unit/reference range is missing.
- * - Detect common laboratory units.
- * - Reconstruct rows when OCR collapses columns.
- * - Calculate conservative extraction confidence.
+ * Converts text (PDF text layer or OCR output) into structured lab metrics.
  *
- * Safety:
- * - This parser NEVER invents laboratory values.
- * - Missing information is represented as "Not specified".
- * - This parser extracts data; it does NOT diagnose disease.
+ * DESIGN RULES (do not weaken these without a very good reason):
+ *
+ *  1. NEVER invent data. Every returned value is a substring of the input.
+ *  2. PREFER A MISS OVER A MISLABEL. If a row is ambiguous ("Calcium, Ionized",
+ *     "Cholesterol/HDL Ratio", an interpretation paragraph, a range legend), the row is
+ *     skipped. A missing metric is a UX problem; a wrong metric in a health app is a safety problem.
+ *  3. Deterministic and side-effect free. No LLM calls, no diagnosis, no recommendations.
+ *  4. Bounded work: input, line count and line length are capped; all regexes are precompiled
+ *     and free of nested quantifiers.
  *
  * Pipeline:
- *
- * OCR text
- *   ↓
- * normalize OCR
- *   ↓
- * reconstruct rows
- *   ↓
- * detect metric
- *   ↓
- * extract measured value
- *   ↓
- * extract unit
- *   ↓
- * extract reference range
- *   ↓
- * calculate flag
- *   ↓
- * calculate confidence
- *   ↓
- * LabMetric[]
- *
- * IMPORTANT:
- * - Keep this parser deterministic.
- * - Do not put LLM calls, diagnosis logic, or medical recommendations here.
- * - The server-side AI layer should interpret these structured values.
+ *   text -> normalize -> lines -> (skip headers/prose) -> rows (merge wrapped lines)
+ *        -> metric spans -> per-segment analysis (unit, ranges, value) -> flag + confidence
+ *        -> de-duplicate -> LabMetric[]
  */
 
 // ============================================================
@@ -51,22 +28,22 @@
 export interface LabMetric {
   metric: string;
 
-  /** Actual measured laboratory result. */
+  /** Measured result exactly as printed (thousands separators removed). May carry a "<" / ">" qualifier. */
   value: string;
 
-  /** Laboratory unit. */
+  /** Normalized unit, or "Not specified". */
   unit: string;
 
-  /** Reference interval. */
+  /** Reference interval (same as referenceRange; kept for compatibility). */
   range: string;
 
-  /** UI/API-facing reference interval. */
+  /** Reference interval, or "Not specified". Multiple distinct ranges are joined with " / ". */
   referenceRange: string;
 
-  /** Normal / High / Low / N/A. */
+  /** "Normal" | "High" | "Low" | "N/A". Extraction-based, NOT a medical interpretation. */
   flag: string;
 
-  /** Extraction confidence from 0 to 1. */
+  /** Extraction confidence from 0 to 0.95 (OCR can always misread). Not clinical certainty. */
   confidence: number;
 }
 
@@ -74,1580 +51,994 @@ export interface LabMetric {
 // LIMITS
 // ============================================================
 
-/**
- * Defense-in-depth limit.
- *
- * The server action should already enforce a stricter OCR/document
- * size limit. This prevents the parser from being accidentally called
- * with an enormous string elsewhere in the application.
- */
 const MAX_OCR_TEXT_LENGTH = 250_000;
-
 const MAX_LINES = 5_000;
+const MAX_LINE_LENGTH = 400;
+
+/** Wrapped OCR rows: at most this many following lines are merged into one row. */
+const MAX_CONTINUATION_LINES = 3;
+
+/** A result must appear within this many words after the metric name. */
+const MAX_VALUE_GAP_WORDS = 5;
+
+/** Words/characters allowed before a metric name ("1.", "Serum", "CBC", ...). */
+const MAX_PREFIX_TOKENS = 4;
+const MAX_PREFIX_CHARS = 40;
+
+/** Abbreviations this short must have a unit or range to be accepted. */
+const SHORT_ALIAS_LENGTH = 4;
+
+const NOT_SPECIFIED = "Not specified";
 
 // ============================================================
-// KNOWN METRICS
+// METRIC DICTIONARY  (single source of truth)
 // ============================================================
 
 /**
- * Common laboratory metrics.
+ * canonical name -> aliases (the canonical name is always an alias too).
  *
- * Aliases and OCR variations are intentionally included.
+ * Deliberately absent: ambiguous abbreviations that appear in hospital names / prose
+ * (ABC, AMC, PT, TG, K, Na ...). Add them only together with a unit/range guard.
  */
-const KNOWN_METRICS = [
-  // CBC
-  "Haemoglobin",
-  "Hemoglobin",
-  "HB",
-  "HGB",
+const METRIC_DEFINITIONS: Record<string, readonly string[]> = {
+  // ---- CBC ----
+  Haemoglobin: ["Hemoglobin", "Hb", "Hgb"],
+  "Total Leucocyte Count": [
+    "Total Leukocyte Count",
+    "Total WBC Count",
+    "TLC",
+    "WBC Count",
+    "WBC",
+    "White Blood Cell Count",
+    "Leucocyte Count",
+    "Leukocyte Count",
+  ],
+  "Differential Leucocyte Count": ["Differential Leukocyte Count", "DLC"],
+  Neutrophils: ["Neutrophil"],
+  Lymphocytes: ["Lymphocyte"],
+  Eosinophils: ["Eosinophil"],
+  Monocytes: ["Monocyte"],
+  Basophils: ["Basophil"],
+  "Absolute Neutrophils": ["Absolute Neutrophil Count", "ANC"],
+  "Absolute Lymphocytes": ["Absolute Lymphocyte Count", "ALC"],
+  "Absolute Eosinophils": ["Absolute Eosinophil Count", "AEC"],
+  "Absolute Monocytes": ["Absolute Monocyte Count"],
+  "Absolute Basophils": ["Absolute Basophil Count"],
+  "RBC Count": ["RBC", "Red Blood Cell Count", "Total RBC Count"],
+  MCV: ["Mean Corpuscular Volume"],
+  MCH: ["Mean Corpuscular Haemoglobin", "Mean Corpuscular Hemoglobin"],
+  MCHC: [
+    "Mean Corpuscular Haemoglobin Concentration",
+    "Mean Corpuscular Hemoglobin Concentration",
+  ],
+  Hct: ["Hematocrit", "Haematocrit", "PCV", "Packed Cell Volume"],
+  "RDW-CV": ["RDW CV"],
+  "RDW-SD": ["RDW SD"],
+  "Platelet Count": ["Platelets", "Platelet", "PLT"],
+  PCT: ["Plateletcrit", "Platelet Crit"],
+  MPV: ["Mean Platelet Volume"],
+  PDW: ["Platelet Distribution Width"],
+  "Platelet Indices": [],
 
-  "Total Leucocyte Count",
-  "Total Leukocyte Count",
-  "Total WBC Count",
-  "TLC",
-  "WBC Count",
-  "White Blood Cell Count",
+  // ---- Inflammation / glucose ----
+  ESR: ["Erythrocyte Sedimentation Rate"],
+  CRP: ["C-Reactive Protein", "C Reactive Protein"],
+  "hs-CRP": ["hsCRP", "High Sensitivity CRP"],
+  Glucose: [],
+  "Blood Glucose": [],
+  "Fasting Blood Sugar": [
+    "FBS",
+    "Fasting Glucose",
+    "Fasting Plasma Glucose",
+    "Glucose Fasting",
+  ],
+  "Random Blood Sugar": ["RBS", "Random Glucose", "Glucose Random"],
+  "Post Prandial Glucose": [
+    "PPBS",
+    "Post Prandial Blood Sugar",
+    "Postprandial Glucose",
+    "PP Glucose",
+    "Glucose PP",
+    "Glucose Post Prandial",
+  ],
+  HbA1c: [
+    "Glycosylated Haemoglobin",
+    "Glycosylated Hemoglobin",
+    "Glycated Haemoglobin",
+    "Glycated Hemoglobin",
+    "Haemoglobin A1c",
+    "Hemoglobin A1c",
+    "Hb A1c",
+  ],
+  "Estimated Average Glucose": ["eAG"],
 
-  "Differential Leucocyte Count",
-  "Differential Leukocyte Count",
-  "DLC",
+  // ---- Thyroid ----
+  TSH: ["Thyroid Stimulating Hormone"],
+  T3: ["Total T3", "Triiodothyronine"],
+  T4: ["Total T4", "Thyroxine"],
+  "Free T3": ["FT3", "T3 Free"],
+  "Free T4": ["FT4", "T4 Free"],
 
-  "Neutrophils",
-  "Neutrophil",
-  "Lymphocytes",
-  "Lymphocyte",
-  "Eosinophils",
-  "Eosinophil",
-  "Monocytes",
-  "Monocyte",
-  "Basophils",
-  "Basophil",
+  // ---- Kidney ----
+  Creatinine: ["Serum Creatinine"],
+  Urea: [],
+  "Blood Urea": [],
+  BUN: ["Blood Urea Nitrogen", "Urea Nitrogen"],
+  "Uric Acid": ["Serum Uric Acid"],
+  eGFR: ["Estimated GFR", "GFR"],
 
-  "Absolute Neutrophils",
-  "Absolute Neutrophil Count",
-  "ANC",
+  // ---- Lipids ----
+  "Total Cholesterol": ["Cholesterol", "Cholesterol Total", "Serum Cholesterol"],
+  HDL: ["HDL Cholesterol", "HDL-C"],
+  LDL: ["LDL Cholesterol", "LDL-C"],
+  VLDL: ["VLDL Cholesterol"],
+  "Non-HDL Cholesterol": [],
+  Triglycerides: ["Triglyceride"],
 
-  "Absolute Lymphocytes",
-  "Absolute Lymphocyte Count",
-  "ALC",
+  // ---- Liver ----
+  "Total Bilirubin": ["Bilirubin Total", "Serum Bilirubin Total"],
+  "Direct Bilirubin": ["Bilirubin Direct", "Conjugated Bilirubin"],
+  "Indirect Bilirubin": ["Bilirubin Indirect", "Unconjugated Bilirubin"],
+  "AST (SGOT)": ["SGOT", "AST", "SGOT (AST)", "SGOT/AST", "AST/SGOT"],
+  "ALT (SGPT)": ["SGPT", "ALT", "SGPT (ALT)", "SGPT/ALT", "ALT/SGPT"],
+  "Alkaline Phosphatase": ["ALP"],
+  GGT: ["Gamma GT", "Gamma Glutamyl Transferase", "GGTP"],
+  Albumin: ["Serum Albumin"],
+  Globulin: ["Serum Globulin"],
+  "Total Protein": ["Serum Total Protein"],
 
-  "Absolute Eosinophils",
-  "Absolute Eosinophil Count",
-  "AEC",
+  // ---- Electrolytes / minerals ----
+  Sodium: ["Serum Sodium"],
+  Potassium: ["Serum Potassium"],
+  Chloride: ["Serum Chloride"],
+  Calcium: ["Total Calcium", "Serum Calcium"],
+  Magnesium: ["Serum Magnesium"],
+  Phosphorus: ["Phosphate", "Inorganic Phosphorus"],
 
-  "Absolute Monocytes",
-  "Absolute Monocyte Count",
-  "AMC",
+  // ---- Vitamins / iron studies ----
+  "Vitamin B12": ["B12"],
+  "Vitamin D": ["25-OH Vitamin D", "25 Hydroxy Vitamin D", "Vitamin D Total"],
+  Folate: ["Folic Acid"],
+  Ferritin: ["Serum Ferritin"],
+  Iron: ["Serum Iron"],
+  TIBC: ["Total Iron Binding Capacity", "Iron Binding Capacity"],
+  UIBC: ["Unsaturated Iron Binding Capacity"],
+  "Transferrin Saturation": [],
 
-  "Absolute Basophils",
-  "Absolute Basophil Count",
-  "ABC",
+  // ---- Hormones / markers ----
+  Insulin: [],
+  Testosterone: ["Total Testosterone"],
+  Progesterone: [],
+  Estradiol: [],
+  Cortisol: [],
+  Prolactin: [],
+  PSA: ["Total PSA", "Prostate Specific Antigen"],
+  Homocysteine: [],
 
-  // RBC
-  "RBC Count",
-  "RBC",
-  "Red Blood Cell Count",
-
-  "MCV",
-  "Mean Corpuscular Volume",
-
-  "MCH",
-  "Mean Corpuscular Haemoglobin",
-  "Mean Corpuscular Hemoglobin",
-
-  "MCHC",
-  "Mean Corpuscular Haemoglobin Concentration",
-  "Mean Corpuscular Hemoglobin Concentration",
-
-  "Hct",
-  "HCT",
-  "Hematocrit",
-  "Haematocrit",
-  "PCV",
-  "Packed Cell Volume",
-
-  "RDW-CV",
-  "RDW CV",
-  "RDW-CV%",
-  "RDW-SD",
-
-  // Platelets
-  "Platelet Count",
-  "Platelets",
-  "Platelet",
-  "PCT",
-  "Plateletcrit",
-  "Platelet Crit",
-  "MPV",
-  "Mean Platelet Volume",
-  "PDW",
-  "Platelet Distribution Width",
-  "Platelet Indices",
-
-  // Inflammation / glucose
-  "ESR",
-  "CRP",
-  "Blood Glucose",
-  "Glucose",
-  "Fasting Blood Sugar",
-  "FBS",
-  "Random Blood Sugar",
-  "RBS",
-  "HbA1c",
-
-  // Thyroid
-  "TSH",
-  "T3",
-  "T4",
-  "Free T3",
-  "Free T4",
-
-  // Kidney
-  "Creatinine",
-  "Urea",
-  "Blood Urea",
-  "BUN",
-  "Uric Acid",
-
-  // Lipids
-  "Total Cholesterol",
-  "Cholesterol",
-  "HDL",
-  "LDL",
-  "VLDL",
-  "Triglycerides",
-
-  // Liver
-  "Bilirubin Total",
-  "Total Bilirubin",
-  "Bilirubin Direct",
-  "Direct Bilirubin",
-  "Bilirubin Indirect",
-  "Indirect Bilirubin",
-
-  "SGOT",
-  "AST",
-  "SGPT",
-  "ALT",
-  "ALP",
-  "Alkaline Phosphatase",
-  "Albumin",
-  "Total Protein",
-
-  // Electrolytes
-  "Sodium",
-  "Potassium",
-  "Chloride",
-  "Calcium",
-  "Magnesium",
-  "Phosphorus",
-
-  // Vitamins / iron
-  "Vitamin B12",
-  "Vitamin D",
-  "Ferritin",
-  "Iron",
-
-  // Hormones
-  "Insulin",
-  "Testosterone",
-  "Progesterone",
-  "Estradiol",
-  "Cortisol",
-
-  // Enzymes
-  "Amylase",
-  "Lipase",
-] as const;
-
-/**
- * Canonical metric names.
- */
-const METRIC_ALIASES: Record<string, string> = {
-  // CBC
-  haemoglobin: "Haemoglobin",
-  hemoglobin: "Haemoglobin",
-  hb: "Haemoglobin",
-  hgb: "Haemoglobin",
-
-  "total leucocyte count": "Total Leucocyte Count",
-  "total leukocyte count": "Total Leucocyte Count",
-  "total wbc count": "Total Leucocyte Count",
-  tlc: "Total Leucocyte Count",
-  "wbc count": "Total Leucocyte Count",
-  "white blood cell count": "Total Leucocyte Count",
-
-  "differential leucocyte count": "Differential Leucocyte Count",
-  "differential leukocyte count": "Differential Leucocyte Count",
-  dlc: "Differential Leucocyte Count",
-
-  neutrophil: "Neutrophils",
-  neutrophils: "Neutrophils",
-  lymphocyte: "Lymphocytes",
-  lymphocytes: "Lymphocytes",
-  eosinophil: "Eosinophils",
-  eosinophils: "Eosinophils",
-  monocyte: "Monocytes",
-  monocytes: "Monocytes",
-  basophil: "Basophils",
-  basophils: "Basophils",
-
-  "absolute neutrophils": "Absolute Neutrophils",
-  "absolute neutrophil count": "Absolute Neutrophils",
-  anc: "Absolute Neutrophils",
-
-  "absolute lymphocytes": "Absolute Lymphocytes",
-  "absolute lymphocyte count": "Absolute Lymphocytes",
-  alc: "Absolute Lymphocytes",
-
-  "absolute eosinophils": "Absolute Eosinophils",
-  "absolute eosinophil count": "Absolute Eosinophils",
-  aec: "Absolute Eosinophils",
-
-  "absolute monocytes": "Absolute Monocytes",
-  "absolute monocyte count": "Absolute Monocytes",
-  amc: "Absolute Monocytes",
-
-  "absolute basophils": "Absolute Basophils",
-  "absolute basophil count": "Absolute Basophils",
-  abc: "Absolute Basophils",
-
-  // RBC
-  "rbc count": "RBC Count",
-  rbc: "RBC Count",
-  "red blood cell count": "RBC Count",
-
-  mcv: "MCV",
-  "mean corpuscular volume": "MCV",
-
-  mch: "MCH",
-  "mean corpuscular haemoglobin": "MCH",
-  "mean corpuscular hemoglobin": "MCH",
-
-  mchc: "MCHC",
-  "mean corpuscular haemoglobin concentration": "MCHC",
-  "mean corpuscular hemoglobin concentration": "MCHC",
-
-  hct: "Hct",
-  hematocrit: "Hct",
-  haematocrit: "Hct",
-  pcv: "Hct",
-  "packed cell volume": "Hct",
-
-  "rdw-cv": "RDW-CV",
-  "rdw cv": "RDW-CV",
-  "rdw-cv%": "RDW-CV",
-  "rdw-sd": "RDW-SD",
-
-  // Platelets
-  "platelet count": "Platelet Count",
-  platelets: "Platelet Count",
-  platelet: "Platelet Count",
-
-  pct: "PCT",
-  plateletcrit: "PCT",
-  "platelet crit": "PCT",
-
-  mpv: "MPV",
-  "mean platelet volume": "MPV",
-
-  pdw: "PDW",
-  "platelet distribution width": "PDW",
-
-  "platelet indices": "Platelet Indices",
-
-  // General tests
-  esr: "ESR",
-  crp: "CRP",
-
-  glucose: "Glucose",
-  "blood glucose": "Blood Glucose",
-
-  fbs: "Fasting Blood Sugar",
-  "fasting blood sugar": "Fasting Blood Sugar",
-
-  rbs: "Random Blood Sugar",
-  "random blood sugar": "Random Blood Sugar",
-
-  hba1c: "HbA1c",
-
-  // Thyroid
-  tsh: "TSH",
-  t3: "T3",
-  t4: "T4",
-  "free t3": "Free T3",
-  "free t4": "Free T4",
-
-  // Kidney
-  creatinine: "Creatinine",
-  urea: "Urea",
-  "blood urea": "Blood Urea",
-  bun: "BUN",
-  "uric acid": "Uric Acid",
-
-  // Lipids
-  "total cholesterol": "Total Cholesterol",
-  cholesterol: "Cholesterol",
-  hdl: "HDL",
-  ldl: "LDL",
-  vldl: "VLDL",
-  triglycerides: "Triglycerides",
-
-  // Liver
-  "bilirubin total": "Bilirubin Total",
-  "total bilirubin": "Total Bilirubin",
-  "bilirubin direct": "Bilirubin Direct",
-  "direct bilirubin": "Direct Bilirubin",
-  "bilirubin indirect": "Bilirubin Indirect",
-  "indirect bilirubin": "Indirect Bilirubin",
-
-  sgot: "SGOT",
-  ast: "AST",
-  sgpt: "SGPT",
-  alt: "ALT",
-  alp: "ALP",
-  "alkaline phosphatase": "Alkaline Phosphatase",
-  albumin: "Albumin",
-  "total protein": "Total Protein",
-
-  // Electrolytes
-  sodium: "Sodium",
-  potassium: "Potassium",
-  chloride: "Chloride",
-  calcium: "Calcium",
-  magnesium: "Magnesium",
-  phosphorus: "Phosphorus",
-
-  // Vitamins / iron
-  "vitamin b12": "Vitamin B12",
-  "vitamin d": "Vitamin D",
-  ferritin: "Ferritin",
-  iron: "Iron",
-
-  // Hormones
-  insulin: "Insulin",
-  testosterone: "Testosterone",
-  progesterone: "Progesterone",
-  estradiol: "Estradiol",
-  cortisol: "Cortisol",
-
-  // Enzymes
-  amylase: "Amylase",
-  lipase: "Lipase",
+  // ---- Enzymes / coagulation ----
+  Amylase: [],
+  Lipase: [],
+  "Prothrombin Time": [],
+  INR: [],
 };
 
-/**
- * Longest metric first.
- *
- * This is intentionally calculated once instead of sorting on every row.
- */
-const SORTED_METRICS = [...KNOWN_METRICS].sort(
-  (a, b) => b.length - a.length
-);
+/** Differential count names that become "Absolute X" when reported with a count unit. */
+const ABSOLUTE_COUNT_NAMES: Record<string, string> = {
+  Neutrophils: "Absolute Neutrophils",
+  Lymphocytes: "Absolute Lymphocytes",
+  Eosinophils: "Absolute Eosinophils",
+  Monocytes: "Absolute Monocytes",
+  Basophils: "Absolute Basophils",
+};
 
 // ============================================================
-// REGEX / TOKENIZATION
+// REGEX BUILDING (all compiled once at module load)
 // ============================================================
-
-/**
- * Numeric token.
- *
- * Supports:
- * 15
- * 15.2
- * .5
- * 0.5
- * 1,250
- * 1,250.50
- * -2.5
- */
-const NUMBER_PATTERN =
-  String.raw`[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|[-+]?\.\d+`;
-
-/**
- * Reference ranges:
- *
- * 13-17
- * 13 - 17
- * 13.5–17.5
- * 0.5 to 1.2
- * <5
- * <=5
- * ≤5
- * >40
- * >=40
- * ≥40
- */
-const RANGE_REGEX = new RegExp(
-  String.raw`(?:<=|>=|<|>|≤|≥)?\s*(${NUMBER_PATTERN})\s*(?:-|to)\s*(${NUMBER_PATTERN})|(?:<=|>=|<|>|≤|≥)\s*(${NUMBER_PATTERN})`,
-  "i"
-);
-
-/**
- * Laboratory units.
- *
- * Keep longer/specific units first.
- */
-const UNIT_PATTERNS = [
-  /mg\s*\/\s*dL/i,
-  /g\s*\/\s*dL/i,
-  /mmol\s*\/\s*L/i,
-  /mEq\s*\/\s*L/i,
-  /mIU\s*\/\s*L/i,
-  /mIU\s*\/\s*mL/i,
-  /µIU\s*\/\s*mL/i,
-  /uIU\s*\/\s*mL/i,
-  /IU\s*\/\s*L/i,
-  /IU\s*\/\s*mL/i,
-  /U\s*\/\s*L/i,
-  /ng\s*\/\s*mL/i,
-  /ng\s*\/\s*dL/i,
-  /µg\s*\/\s*dL/i,
-  /ug\s*\/\s*dL/i,
-  /µg\s*\/\s*L/i,
-  /ug\s*\/\s*L/i,
-  /mcg\s*\/\s*dL/i,
-  /mcg\s*\/\s*L/i,
-  /mEq\s*\/\s*L/i,
-  /mOsm\s*\/\s*kg/i,
-  /cells?\s*\/\s*(?:cumm|cu\.?\s*mm|µL|uL)/i,
-  /million\s*\/\s*(?:cumm|µL|uL)/i,
-  /lakhs?\s*\/\s*(?:µL|uL)/i,
-  /x\s*10\s*\^\s*\d+\s*\/\s*L/i,
-  /10\s*\^\s*\d+\s*\/\s*L/i,
-  /10\s*9\s*\/\s*L/i,
-  /10\s*12\s*\/\s*L/i,
-  /fL/i,
-  /pg/i,
-  /%/i,
-  /mL/i,
-  /dL/i,
-  /cumm/i,
-  /cu\.?\s*mm/i,
-] as const;
-
-/**
- * Words commonly found in table headers.
- */
-const HEADER_WORDS = [
-  "test",
-  "test description",
-  "investigation",
-  "parameter",
-  "result",
-  "results",
-  "reference range",
-  "ref range",
-  "normal range",
-  "unit",
-  "units",
-  "bio reference",
-] as const;
-
-/**
- * Words indicating that the result is not numerically available.
- *
- * IMPORTANT:
- * We do not automatically discard every row containing one of these
- * words. If a numeric value is present, the numeric value is preserved.
- */
-const NON_VALUE_WORDS = [
-  "not done",
-  "not available",
-  "not detected",
-  "pending",
-  "cancelled",
-  "canceled",
-] as const;
-
-// ============================================================
-// INTERNAL TYPES
-// ============================================================
-
-interface PositionedToken {
-  value: string;
-  index: number;
-  length: number;
-}
-
-interface PositionedMatch {
-  value: string;
-  index: number;
-  length: number;
-}
-
-interface MetricMatch {
-  metric: string;
-  index: number;
-  length: number;
-}
-
-// ============================================================
-// GENERAL HELPERS
-// ============================================================
-
-function normalizeWhitespace(value: string): string {
-  return value
-    .replace(/\u00a0/g, " ")
-    .replace(/[|│]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-/**
- * Normalize common OCR punctuation while preserving line breaks.
- */
-function normalizeOCRText(text: string): string {
-  return text
-    .replace(/\r\n/g, "\n")
-    .replace(/\r/g, "\n")
-    .replace(/[“”]/g, '"')
-    .replace(/[‘’]/g, "'")
-    .replace(/[‐-‒–—]/g, "-")
-    .replace(/\u00a0/g, " ");
-}
-
-function cleanMetricName(value: string): string {
-  return normalizeWhitespace(value)
-    .replace(/^[:;,.\-]+/, "")
-    .replace(/[:;,.\-]+$/, "")
-    .trim();
-}
-
-function cleanNumericValue(value: string): string {
-  return value.replace(/,/g, "").trim();
-}
-
-function cleanText(value: unknown): string {
-  return typeof value === "string" ? normalizeWhitespace(value) : "";
-}
-
-function canonicalMetricName(metric: string): string {
-  const cleaned = cleanMetricName(metric);
-  return METRIC_ALIASES[cleaned.toLowerCase()] || cleaned;
-}
 
 function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+function aliasKey(value: string): string {
+  return value.toLowerCase().replace(/[\s,]+/g, " ").trim();
+}
+
+const ALIAS_TO_CANONICAL = new Map<string, string>();
+
+for (const [canonical, aliases] of Object.entries(METRIC_DEFINITIONS)) {
+  for (const alias of [canonical, ...aliases]) {
+    const key = aliasKey(alias);
+    if (!ALIAS_TO_CANONICAL.has(key)) {
+      ALIAS_TO_CANONICAL.set(key, canonical);
+    }
+  }
+}
+
 /**
- * Boundary-safe metric pattern.
- *
- * We intentionally do NOT use plain indexOf() here.
- *
- * This prevents:
- * - "Iron" matching inside unrelated words
- * - "T3" matching inside another token
- * - "ALT" matching inside "ALTERED"
- * - "HDL" matching inside arbitrary text
+ * One alternation, longest alias first, so "Mean Corpuscular Haemoglobin Concentration"
+ * wins over "Mean Corpuscular Haemoglobin" and "HDL Cholesterol" wins over "Cholesterol".
+ * Whitespace inside an alias also tolerates commas ("Bilirubin, Total").
  */
-function createMetricRegex(metric: string): RegExp {
-  const escaped = escapeRegex(metric).replace(/\s+/g, String.raw`\s+`);
+const METRIC_REGEX = new RegExp(
+  String.raw`(?<![A-Za-z0-9])(?:${[...ALIAS_TO_CANONICAL.keys()]
+    .sort((a, b) => b.length - a.length)
+    .map((key) => escapeRegex(key).replace(/ /g, String.raw`[\s,]+`))
+    .join("|")})(?![A-Za-z0-9])`,
+  "gi"
+);
 
-  return new RegExp(
-    String.raw`(?<![A-Za-z0-9])${escaped}(?![A-Za-z0-9])`,
-    "i"
-  );
+/**
+ * Numbers: plain, decimal, Western grouping (1,250,000) and Indian grouping (2,50,000).
+ * Signs are intentionally unsupported: lab results are non-negative and "13-17" must stay a range.
+ */
+const NUMBER = String.raw`(?:\d{1,3}(?:,\d{3})+|\d{1,2}(?:,\d{2})+,\d{3}|\d+)(?:\.\d+)?|\.\d+`;
+
+const NUMBER_REGEX = new RegExp(NUMBER, "g");
+
+const TWO_SIDED_RANGE_REGEX = new RegExp(
+  String.raw`(?<![\w.,])(${NUMBER})\s*(?:-|to)\s*(${NUMBER})`,
+  "gi"
+);
+
+const BOUND_REGEX = new RegExp(
+  String.raw`(?<![\w.])(<=|>=|<|>|up\s*to|upto|not\s+more\s+than|less\s+than|below|under|greater\s+than|more\s+than|above|over)\s*[:=]?\s*(${NUMBER})`,
+  "gi"
+);
+
+/** Units. Boundaries stop "dL" matching inside "Handle", "fL" inside "Reflex", etc. */
+const NUMERATOR = String.raw`(?:mmol|nmol|pmol|µmol|umol|mEq|mOsm|mIU|µIU|uIU|gms|gm|mcg|µg|ug|mg|ng|pg|kU|IU|g|U)`;
+const DENOMINATOR = String.raw`(?:dL|mL|µL|uL|kg|hr|L)`;
+
+const UNIT_SOURCE = [
+  // 10^3/µL, x10^9/L, 10 9/L
+  String.raw`(?:x\s*)?10\s*[\^*]?\s*\d{1,2}\s*\/\s*(?:µL|uL|L|cumm|mm3)`,
+  // million/cumm, thou/mm3, lakhs/µL
+  String.raw`(?:million|mill|thou|lakhs?)\s*\/\s*(?:cu\.?\s*mm|cumm|mm3|µL|uL)`,
+  // cells/cumm, /cumm, /cu.mm, /mm3, cells/µL
+  String.raw`(?:cells?\s*)?\/\s*(?:cu\.?\s*mm|cumm|mm3|cmm|µL|uL)`,
+  // g/dL, gm/dL, mg/dL, mmol/L, ng/mL, µIU/mL, IU/L, U/L ...
+  String.raw`${NUMERATOR}\s*\/\s*${DENOMINATOR}`,
+  // ESR
+  String.raw`mm\s*\/\s*(?:1st\s*)?(?:hr|h|hour)`,
+  // standalone
+  String.raw`gm\s*%|g\s*%`,
+  String.raw`fL`,
+  String.raw`pg`,
+  String.raw`%`,
+  String.raw`sec(?:onds?)?`,
+].join("|");
+
+const UNIT_REGEX = new RegExp(
+  String.raw`(?<![A-Za-z])(?:${UNIT_SOURCE})(?![A-Za-z])`,
+  "gi"
+);
+
+/** Non-global twin of UNIT_REGEX for .test(): global regexes keep lastIndex state between calls. */
+const UNIT_PROBE_REGEX = new RegExp(UNIT_REGEX.source, "i");
+
+// ---- header / prose / noise detection ----
+
+const HEADER_TERM_REGEXES = [
+  "test name",
+  "test description",
+  "test",
+  "investigation",
+  "parameter",
+  "result",
+  "results",
+  "value",
+  "unit",
+  "units",
+  "reference range",
+  "reference interval",
+  "ref range",
+  "normal range",
+  "bio reference",
+  "biological reference",
+  "interval",
+  "method",
+  "flag",
+  "remarks",
+].map((term) => new RegExp(String.raw`\b${term}\b`, "i"));
+
+/** Sentences found in interpretation notes, never in table rows. */
+const PROSE_CUE_REGEX =
+  /\b(?:indicates?|indicative|suggest(?:s|ive|ed)?|consistent with|diagnos\w*|recommend\w*|should|associated with|risk of|criteria|interpretation|clinical|correlat\w*|patients?|therapy|treatment|screening)\b/i;
+
+const MAX_PROSE_WORDS = 16;
+
+/** Lines that must never be merged into a metric row. */
+const NOISE_LINE_REGEX =
+  /\b(?:page|dob|date|collected|reported|registered|received|specimen|barcode|lab\s*no|uhid|mrn|patient|doctor|dr\.?|phone|mobile|age|sex|gender|accession|sample)\b/i;
+
+/**
+ * Words that change WHICH test a row is. If one sits next to a metric name we do not
+ * recognise as an alias ("Calcium, Ionized", "Cholesterol/HDL Ratio", "Glucose, Urine",
+ * "Neutrophils (Absolute)", "Reverse T3"), we skip the row instead of mislabeling it.
+ * Also covers words that mean "this is reference text, not a result".
+ */
+const QUALIFIER_DENY = new Set([
+  "free",
+  "ionized",
+  "ionised",
+  "corrected",
+  "estimated",
+  "calculated",
+  "urine",
+  "urinary",
+  "csf",
+  "fluid",
+  "ratio",
+  "index",
+  "absolute",
+  "reverse",
+  "delta",
+  "cord",
+  "neonatal",
+  "spot",
+  "post",
+  "postprandial",
+  "pp",
+  "pre",
+  // reference-text legends: "Desirable: <200", "Normal range ..."
+  "normal",
+  "desirable",
+  "optimal",
+  "borderline",
+  "reference",
+  "ref",
+  "range",
+  "adult",
+  "adults",
+  "male",
+  "female",
+  "child",
+  "children",
+  "men",
+  "women",
+]);
+
+// ============================================================
+// SMALL HELPERS
+// ============================================================
+
+const SUPERSCRIPT_DIGITS: Record<string, string> = {
+  "\u2070": "0",
+  "\u00b9": "1",
+  "\u00b2": "2",
+  "\u00b3": "3",
+  "\u2074": "4",
+  "\u2075": "5",
+  "\u2076": "6",
+  "\u2077": "7",
+  "\u2078": "8",
+  "\u2079": "9",
+};
+
+function normalizeWhitespace(value: string): string {
+  return value
+    .replace(/\u00a0/g, " ")
+    .replace(/[|\u2502]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
-function normalizeUnit(unit: string): string {
-  const cleaned = normalizeWhitespace(unit);
-
-  if (!cleaned) {
-    return "Not specified";
-  }
-
-  const lower = cleaned.toLowerCase();
-
-  const normalizedMap: Record<string, string> = {
-    "g/dl": "g/dL",
-    "g / dl": "g/dL",
-
-    "mg/dl": "mg/dL",
-    "mg / dl": "mg/dL",
-
-    "mmol/l": "mmol/L",
-    "mmol / l": "mmol/L",
-
-    "miu/l": "mIU/L",
-    "miu / l": "mIU/L",
-
-    "miu/ml": "mIU/mL",
-    "miu / ml": "mIU/mL",
-
-    "uiu/ml": "uIU/mL",
-    "uiu / ml": "uIU/mL",
-
-    "µiu/ml": "µIU/mL",
-    "µiu / ml": "µIU/mL",
-
-    "iu/l": "IU/L",
-    "iu / l": "IU/L",
-
-    "iu/ml": "IU/mL",
-    "iu / ml": "IU/mL",
-
-    "u/l": "U/L",
-    "u / l": "U/L",
-
-    "ng/ml": "ng/mL",
-    "ng / ml": "ng/mL",
-
-    "ng/dl": "ng/dL",
-    "ng / dl": "ng/dL",
-
-    "µg/dl": "µg/dL",
-    "µg / dl": "µg/dL",
-
-    "ug/dl": "µg/dL",
-    "ug / dl": "µg/dL",
-
-    "µg/l": "µg/L",
-    "µg / l": "µg/L",
-
-    "ug/l": "µg/L",
-    "ug / l": "µg/L",
-
-    "mcg/dl": "µg/dL",
-    "mcg / dl": "µg/dL",
-
-    "mcg/l": "µg/L",
-    "mcg / l": "µg/L",
-
-    "fl": "fL",
-
-    "µl": "µL",
-    "ul": "µL",
-
-    "pg": "pg",
-
-    "ml": "mL",
-    "dl": "dL",
-
-    "%": "%",
-
-    "cumm": "cells/cumm",
-    "cu mm": "cells/cumm",
-    "cu. mm": "cells/cumm",
-  };
-
-  return normalizedMap[lower] || cleaned;
+function normalizeOCRText(text: string): string {
+  return text
+    .replace(/\r\n?/g, "\n")
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "")
+    .replace(/[\u201C\u201D]/g, '"')
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/[\u2010-\u2015\u2212]/g, "-") // every dash/minus variant -> "-"
+    .replace(/\u03bc/g, "\u00b5") // Greek mu -> micro sign
+    .replace(/\u00d7/g, "x")
+    .replace(/\u2264/g, "<=")
+    .replace(/\u2265/g, ">=")
+    .replace(/[\u2070\u00b9\u00b2\u00b3\u2074-\u2079]+/g, (run) =>
+      "^" + [...run].map((ch) => SUPERSCRIPT_DIGITS[ch] ?? "").join("")
+    );
 }
 
-function normalizeRange(value: string): string {
-  const cleaned = normalizeWhitespace(value);
-
-  if (!cleaned) {
-    return "Not specified";
-  }
-
-  return cleaned
-    .replace(/≤/g, "<=")
-    .replace(/≥/g, ">=")
-    .replace(/\s*-\s*/g, " - ")
-    .replace(/\s+to\s+/i, " to ");
+function cleanNumber(value: string): string {
+  return value.replace(/,/g, "").trim();
 }
 
-function isHeaderLine(line: string): boolean {
-  const normalized = normalizeWhitespace(line).toLowerCase();
-
-  return HEADER_WORDS.some(header => {
-    if (normalized === header) {
-      return true;
-    }
-
-    if (normalized.startsWith(`${header} `)) {
-      return true;
-    }
-
-    if (normalized.endsWith(` ${header}`)) {
-      return true;
-    }
-
-    return normalized.includes(` ${header} `);
-  });
+function toNumber(value: string): number {
+  return Number(cleanNumber(value));
 }
 
-function containsUnavailableResult(line: string): boolean {
-  const lower = line.toLowerCase();
+interface Span {
+  start: number;
+  end: number;
+}
 
-  return NON_VALUE_WORDS.some(word => lower.includes(word));
+function overlaps(a: Span, b: Span): boolean {
+  return a.start < b.end && b.start < a.end;
+}
+
+function overlapsAny(span: Span, others: Span[]): boolean {
+  return others.some((other) => overlaps(span, other));
 }
 
 // ============================================================
-// METRIC DETECTION
+// UNIT NORMALIZATION
 // ============================================================
 
-function findMetricInLine(line: string): MetricMatch | null {
-  const normalized = normalizeWhitespace(line);
+const NUMERATOR_NAMES: Record<string, string> = {
+  g: "g",
+  gm: "g",
+  gms: "g",
+  mg: "mg",
+  "µg": "µg",
+  ug: "µg",
+  mcg: "µg",
+  ng: "ng",
+  pg: "pg",
+  nmol: "nmol",
+  pmol: "pmol",
+  "µmol": "µmol",
+  umol: "µmol",
+  mmol: "mmol",
+  meq: "mEq",
+  mosm: "mOsm",
+  miu: "mIU",
+  "µiu": "µIU",
+  uiu: "µIU",
+  iu: "IU",
+  u: "U",
+  ku: "kU",
+};
 
-  for (const candidate of SORTED_METRICS) {
-    const regex = createMetricRegex(candidate);
-    const match = regex.exec(normalized);
+const DENOMINATOR_NAMES: Record<string, string> = {
+  dl: "dL",
+  l: "L",
+  ml: "mL",
+  "µl": "µL",
+  ul: "µL",
+  kg: "kg",
+  hr: "hr",
+};
 
-    if (!match || match.index !== 0) {
-      continue;
-    }
+function normalizeUnit(raw: string): string {
+  const compact = raw.replace(/\s+/g, "").toLowerCase();
 
-    return {
-      metric: canonicalMetricName(candidate),
-      index: 0,
-      length: match[0].length,
-    };
+  if (!compact) return NOT_SPECIFIED;
+  if (compact === "%") return "%";
+  if (compact === "g%" || compact === "gm%") return "g%";
+  if (compact === "fl") return "fL";
+  if (compact === "pg") return "pg";
+  if (/^sec(?:onds?)?$/.test(compact)) return "sec";
+  if (/^mm\/(?:1st)?(?:hr|h|hour)$/.test(compact)) return "mm/hr";
+
+  if (/^(?:cells?)?\/(?:cu\.?mm|cumm|mm3|cmm)$/.test(compact)) return "cells/cumm";
+  if (/^(?:cells?)?\/(?:µl|ul)$/.test(compact)) return "cells/µL";
+
+  const population = /^(million|mill|thou|lakhs?)\/(cu\.?mm|cumm|mm3|µl|ul)$/.exec(compact);
+  if (population) {
+    const head = population[1].startsWith("lakh")
+      ? "lakhs"
+      : population[1] === "thou"
+        ? "thou"
+        : "million";
+    return `${head}/${/µl|ul/.test(population[2]) ? "µL" : "cumm"}`;
+  }
+
+  const scientific = /^x?10[\^*]?(\d{1,2})\/(l|µl|ul|cumm|mm3)$/.exec(compact);
+  if (scientific) {
+    const denominator = /µl|ul/.test(scientific[2])
+      ? "µL"
+      : /cumm|mm3/.test(scientific[2])
+        ? "cumm"
+        : "L";
+    return `10^${scientific[1]}/${denominator}`;
+  }
+
+  const rate = /^([a-zµ]+)\/([a-zµ]+)$/.exec(compact);
+  if (rate) {
+    const numerator = NUMERATOR_NAMES[rate[1]];
+    const denominator = DENOMINATOR_NAMES[rate[2]];
+    if (numerator && denominator) return `${numerator}/${denominator}`;
+  }
+
+  return raw.trim();
+}
+
+// ============================================================
+// REFERENCE RANGES
+// ============================================================
+
+type RefRange =
+  | { kind: "between"; low: number; high: number; text: string }
+  | { kind: "max"; limit: number; inclusive: boolean; text: string }
+  | { kind: "min"; limit: number; inclusive: boolean; text: string };
+
+function boundToRange(operator: string, numberText: string): RefRange | null {
+  const limit = toNumber(numberText);
+  if (!Number.isFinite(limit)) return null;
+
+  const op = operator.toLowerCase().replace(/\s+/g, " ");
+  const printed = cleanNumber(numberText);
+
+  const isMax = ["<", "<=", "up to", "upto", "not more than", "less than", "below", "under"].includes(op);
+  const isMin = [">", ">=", "greater than", "more than", "above", "over"].includes(op);
+  const inclusive = ["<=", ">=", "up to", "upto", "not more than"].includes(op);
+
+  if (isMax) {
+    return { kind: "max", limit, inclusive, text: `${inclusive ? "<=" : "<"}${printed}` };
+  }
+
+  if (isMin) {
+    return { kind: "min", limit, inclusive, text: `${inclusive ? ">=" : ">"}${printed}` };
   }
 
   return null;
 }
 
-function findMetricAnywhere(line: string): MetricMatch | null {
-  const normalized = normalizeWhitespace(line);
-
-  for (const candidate of SORTED_METRICS) {
-    const regex = createMetricRegex(candidate);
-    const match = regex.exec(normalized);
-
-    if (!match || match.index === undefined) {
-      continue;
-    }
-
-    return {
-      metric: canonicalMetricName(candidate),
-      index: match.index,
-      length: match[0].length,
-    };
-  }
-
-  return null;
+function formatQualifier(operator: string): string {
+  const op = operator.toLowerCase().replace(/\s+/g, " ");
+  if (["<", "less than", "below", "under"].includes(op)) return "<";
+  if (["<=", "up to", "upto", "not more than"].includes(op)) return "<=";
+  if ([">", "greater than", "more than", "above", "over"].includes(op)) return ">";
+  return ">=";
 }
 
 // ============================================================
-// RANGE EXTRACTION
+// ROW ANALYSIS (text after a metric name)
 // ============================================================
 
-function extractRange(text: string): PositionedMatch | null {
-  const normalized = normalizeWhitespace(text);
-  const match = RANGE_REGEX.exec(normalized);
-
-  if (!match || match.index === undefined) {
-    return null;
-  }
-
-  const raw = match[0].trim();
-
-  return {
-    value: normalizeRange(raw),
-    index: match.index,
-    length: raw.length,
-  };
+interface RowAnalysis {
+  value: string;
+  hasQualifier: boolean;
+  unit: string;
+  ranges: RefRange[];
+  gapWords: string[];
 }
 
-// ============================================================
-// UNIT EXTRACTION
-// ============================================================
-
-function extractUnit(text: string): PositionedMatch | null {
-  const normalized = normalizeWhitespace(text);
-
-  let best: PositionedMatch | null = null;
-
-  for (const pattern of UNIT_PATTERNS) {
-    const match = pattern.exec(normalized);
-
-    if (!match || match.index === undefined) {
-      continue;
-    }
-
-    const raw = match[0].trim();
-
-    if (!raw) {
-      continue;
-    }
-
-    const candidate: PositionedMatch = {
-      value: normalizeUnit(raw),
-      index: match.index,
-      length: raw.length,
-    };
-
-    /**
-     * Prefer the earliest unit because a laboratory row normally has
-     * the unit directly after the measured value.
-     *
-     * If two patterns match at the same position, prefer the longer one.
-     */
-    if (
-      !best ||
-      candidate.index < best.index ||
-      (candidate.index === best.index &&
-        candidate.length > best.length)
-    ) {
-      best = candidate;
-    }
-  }
-
-  return best;
+interface Found<T> extends Span {
+  data: T;
 }
 
-// ============================================================
-// NUMBER EXTRACTION
-// ============================================================
+function findAll<T>(
+  regex: RegExp,
+  text: string,
+  map: (match: RegExpExecArray) => T | null
+): Array<Found<T>> {
+  const results: Array<Found<T>> = [];
 
-function extractNumbers(text: string): PositionedToken[] {
-  const regex = new RegExp(NUMBER_PATTERN, "g");
-  const results: PositionedToken[] = [];
-
-  let match: RegExpExecArray | null;
-
-  while ((match = regex.exec(text)) !== null) {
-    results.push({
-      value: cleanNumericValue(match[0]),
-      index: match.index,
-      length: match[0].length,
-    });
+  for (const match of text.matchAll(regex)) {
+    const data = map(match as RegExpExecArray);
+    if (data === null) continue;
+    results.push({ start: match.index ?? 0, end: (match.index ?? 0) + match[0].length, data });
   }
 
   return results;
 }
 
-// ============================================================
-// RESULT VALUE EXTRACTION
-// ============================================================
+/** "14-10-2026" and "12/05/24" must never be read as the range 14-10. */
+function looksLikeDatePart(text: string, span: Span): boolean {
+  const before = text.slice(Math.max(0, span.start - 2), span.start);
+  const after = text.slice(span.end, span.end + 2);
 
-/**
- * Determine whether a numeric token overlaps the reference range.
- */
-function isInsideRange(
-  number: PositionedToken,
-  range: PositionedMatch
-): boolean {
-  const numberStart = number.index;
-  const numberEnd = number.index + number.length;
-
-  const rangeStart = range.index;
-  const rangeEnd = range.index + range.length;
-
-  return numberStart < rangeEnd && numberEnd > rangeStart;
+  return /\d[-/.]$/.test(before) || /^[-/]\d/.test(after);
 }
 
-/**
- * Extract the measured laboratory value.
- *
- * Examples:
- *
- * Haemoglobin 15 g/dL 13-17
- *                  ↑
- *              measured value
- *
- * Glucose 102 mg/dL
- *         ↑
- *
- * TSH 2.4 0.4-4.0
- *     ↑
- *
- * The reference range is explicitly excluded from candidate result
- * numbers so that 13 and 17 cannot accidentally become the result.
- */
-function extractResultValue(text: string): string {
-  const normalized = normalizeWhitespace(text);
+function analyzeRest(rest: string): RowAnalysis {
+  const units = findAll(UNIT_REGEX, rest, (m) => normalizeUnit(m[0]));
 
-  const numbers = extractNumbers(normalized);
+  const twoSided = findAll<RefRange>(TWO_SIDED_RANGE_REGEX, rest, (m) => {
+    const low = toNumber(m[1]);
+    const high = toNumber(m[2]);
+    if (!Number.isFinite(low) || !Number.isFinite(high) || low > high) return null;
+    return { kind: "between", low, high, text: `${cleanNumber(m[1])} - ${cleanNumber(m[2])}` };
+  }).filter((item) => !looksLikeDatePart(rest, item) && !overlapsAny(item, units));
 
-  if (numbers.length === 0) {
-    return "";
-  }
-
-  const range = extractRange(normalized);
-
-  const candidateNumbers = range
-    ? numbers.filter(number => !isInsideRange(number, range))
-    : numbers;
-
-  if (candidateNumbers.length === 0) {
-    return "";
-  }
-
-  const unit = extractUnit(normalized);
-
-  /**
-   * If a unit exists, the measured result is usually the closest
-   * numeric token immediately before the unit.
-   */
-  if (unit) {
-    const beforeUnit = candidateNumbers.filter(
-      number => number.index < unit.index
-    );
-
-    if (beforeUnit.length > 0) {
-      return beforeUnit[beforeUnit.length - 1].value;
-    }
-  }
-
-  /**
-   * If a reference range exists, prefer the final numeric value
-   * before that range.
-   */
-  if (range) {
-    const beforeRange = candidateNumbers.filter(
-      number => number.index < range.index
-    );
-
-    if (beforeRange.length > 0) {
-      return beforeRange[beforeRange.length - 1].value;
-    }
-  }
-
-  /**
-   * Final deterministic fallback:
-   * first numeric token that is not part of the reference range.
-   */
-  return candidateNumbers[0]?.value || "";
-}
-
-// ============================================================
-// RANGE PARSING
-// ============================================================
-
-function parseRange(range: string): {
-  low: number | null;
-  high: number | null;
-  operator: string | null;
-} {
-  const normalized = normalizeRange(range);
-
-  if (normalized === "Not specified") {
-    return {
-      low: null,
-      high: null,
-      operator: null,
-    };
-  }
-
-  const twoSidedMatch = normalized.match(
-    new RegExp(
-      String.raw`(${NUMBER_PATTERN})\s*(?:-|to)\s*(${NUMBER_PATTERN})`,
-      "i"
-    )
+  const bounds = findAll(BOUND_REGEX, rest, (m) => ({ operator: m[1], number: m[2] })).filter(
+    (item) => !overlapsAny(item, [...units, ...twoSided])
   );
 
-  if (twoSidedMatch) {
-    const low = Number(cleanNumericValue(twoSidedMatch[1]));
-    const high = Number(cleanNumericValue(twoSidedMatch[2]));
-
-    return {
-      low: Number.isFinite(low) ? low : null,
-      high: Number.isFinite(high) ? high : null,
-      operator: "range",
-    };
-  }
-
-  const operatorMatch = normalized.match(
-    new RegExp(
-      String.raw`(<=|>=|<|>|≤|≥)\s*(${NUMBER_PATTERN})`,
-      "i"
-    )
+  /* Digits inside units ("10^3/µL") are never results. Belt-and-braces: the "last number before
+     the unit" rule below already avoids them, but this keeps the candidate list honest. */
+  const numbers = findAll(NUMBER_REGEX, rest, (m) => cleanNumber(m[0])).filter(
+    (item) => !overlapsAny(item, [...units, ...twoSided, ...bounds])
   );
 
-  if (operatorMatch) {
-    const operator =
-      operatorMatch[1] === "≤"
-        ? "<="
-        : operatorMatch[1] === "≥"
-          ? ">="
-          : operatorMatch[1];
+  /* A "<0.5" BEFORE any other number/unit is a qualified RESULT; anywhere else it is a range. */
+  let qualified: { text: string; span: Span } | null = null;
+  const boundRanges: Array<Found<RefRange>> = [];
 
-    const boundary = Number(cleanNumericValue(operatorMatch[2]));
+  for (const bound of bounds) {
+    const hasNumberBefore = numbers.some((n) => n.start < bound.start);
+    const hasUnitBefore = units.some((u) => u.start < bound.start);
 
-    if (!Number.isFinite(boundary)) {
-      return {
-        low: null,
-        high: null,
-        operator: null,
+    /* Only a SYMBOL ("<0.5"), directly after the name, can be a qualified result.
+       Words ("above 126") and anything preceded by text ("Normal: <100") are reference text. */
+    const isSymbol = /^[<>]/.test(bound.data.operator);
+    const textBefore = /[A-Za-z]/.test(rest.slice(0, bound.start));
+
+    if (!qualified && isSymbol && !textBefore && !hasNumberBefore && !hasUnitBefore) {
+      qualified = {
+        text: `${formatQualifier(bound.data.operator)}${cleanNumber(bound.data.number)}`,
+        span: bound,
       };
+      continue;
     }
 
-    return {
-      low:
-        operator === ">" || operator === ">="
-          ? boundary
-          : null,
-
-      high:
-        operator === "<" || operator === "<="
-          ? boundary
-          : null,
-
-      operator,
-    };
+    const range = boundToRange(bound.data.operator, bound.data.number);
+    if (range) boundRanges.push({ start: bound.start, end: bound.end, data: range });
   }
+
+  const allRanges = [...twoSided, ...boundRanges].sort((a, b) => a.start - b.start);
+
+  const distinct: RefRange[] = [];
+  for (const item of allRanges) {
+    if (!distinct.some((existing) => existing.text === item.data.text)) {
+      distinct.push(item.data);
+    }
+  }
+
+  /* ---- choose the measured value ---- */
+  const firstUnit = units[0];
+  const firstRangeStart = allRanges.length > 0 ? allRanges[0].start : Infinity;
+
+  let value = "";
+
+  if (qualified) {
+    value = qualified.text;
+  } else if (numbers.length > 0) {
+    let chosen: Found<string> | undefined;
+
+    if (firstUnit) {
+      const beforeUnit = numbers.filter((n) => n.start < firstUnit.start);
+      chosen = beforeUnit[beforeUnit.length - 1];
+    }
+
+    if (!chosen) {
+      const beforeRange = numbers.filter((n) => n.start < firstRangeStart);
+      chosen = beforeRange[beforeRange.length - 1];
+    }
+
+    value = (chosen ?? numbers[0]).data;
+  }
+
+  /* ---- words between the metric name and the first structural token ---- */
+  const structuralStarts = [
+    numbers[0]?.start,
+    firstUnit?.start,
+    allRanges[0]?.start,
+    bounds[0]?.start,
+  ].filter((n): n is number => typeof n === "number");
+
+  const gapEnd = structuralStarts.length > 0 ? Math.min(...structuralStarts) : rest.length;
+
+  const gapWords = (rest.slice(0, gapEnd).match(/[A-Za-z]{2,}/g) ?? []).map((w) => w.toLowerCase());
 
   return {
-    low: null,
-    high: null,
-    operator: null,
+    value,
+    hasQualifier: qualified !== null,
+    unit: firstUnit ? firstUnit.data : NOT_SPECIFIED,
+    ranges: distinct,
+    gapWords,
   };
 }
 
 // ============================================================
-// FLAG CALCULATION
+// FLAG + CONFIDENCE
 // ============================================================
 
 /**
- * Calculate a simple extraction-based flag.
- *
- * This is NOT a medical interpretation.
- *
- * Important:
- * - <5  means value must be strictly below 5.
- * - <=5 means value may equal 5.
- * - >40 means value must be strictly above 40.
- * - >=40 means value may equal 40.
+ * Extraction-based flag, NOT a medical interpretation.
+ * Anything ambiguous (qualified result, several reference ranges, no range) is "N/A".
  */
-function calculateFlag(
-  value: string,
-  referenceRange: string
-): string {
-  if (!value || referenceRange === "Not specified") {
-    return "N/A";
+function computeFlag(value: string, ranges: RefRange[], hasQualifier: boolean): string {
+  if (hasQualifier || ranges.length !== 1) return "N/A";
+
+  const numeric = toNumber(value);
+  if (!Number.isFinite(numeric)) return "N/A";
+
+  const range = ranges[0];
+
+  switch (range.kind) {
+    case "between":
+      if (numeric < range.low) return "Low";
+      if (numeric > range.high) return "High";
+      return "Normal";
+
+    case "max":
+      return (range.inclusive ? numeric <= range.limit : numeric < range.limit) ? "Normal" : "High";
+
+    case "min":
+      return (range.inclusive ? numeric >= range.limit : numeric > range.limit) ? "Normal" : "Low";
   }
-
-  const numericValue = Number(cleanNumericValue(value));
-
-  if (!Number.isFinite(numericValue)) {
-    return "N/A";
-  }
-
-  const parsedRange = parseRange(referenceRange);
-
-  // Two-sided range: low - high
-  if (
-    parsedRange.low !== null &&
-    parsedRange.high !== null
-  ) {
-    if (numericValue < parsedRange.low) {
-      return "Low";
-    }
-
-    if (numericValue > parsedRange.high) {
-      return "High";
-    }
-
-    return "Normal";
-  }
-
-  // Upper-bound-only range.
-  if (parsedRange.high !== null) {
-    if (parsedRange.operator === "<") {
-      return numericValue < parsedRange.high
-        ? "Normal"
-        : "High";
-    }
-
-    if (parsedRange.operator === "<=") {
-      return numericValue <= parsedRange.high
-        ? "Normal"
-        : "High";
-    }
-  }
-
-  // Lower-bound-only range.
-  if (parsedRange.low !== null) {
-    if (parsedRange.operator === ">") {
-      return numericValue > parsedRange.low
-        ? "Normal"
-        : "Low";
-    }
-
-    if (parsedRange.operator === ">=") {
-      return numericValue >= parsedRange.low
-        ? "Normal"
-        : "Low";
-    }
-  }
-
-  return "N/A";
 }
 
-// ============================================================
-// CONFIDENCE
-// ============================================================
-
-/**
- * Extraction confidence only.
- *
- * This score does NOT mean:
- * - medical correctness
- * - diagnostic certainty
- * - clinical significance
- *
- * It describes how confidently the parser extracted the row.
- */
-function calculateConfidence(params: {
-  hasValue: boolean;
+function computeConfidence(params: {
   hasUnit: boolean;
   hasRange: boolean;
-  metricRecognized: boolean;
   cleanRow: boolean;
   reconstructed: boolean;
+  multipleRanges: boolean;
+  qualified: boolean;
 }): number {
-  const {
-    hasValue,
-    hasUnit,
-    hasRange,
-    metricRecognized,
-    cleanRow,
-    reconstructed,
-  } = params;
+  let score = 0.45 + 0.15; // value found + metric recognized
 
-  if (!hasValue) {
-    return 0;
-  }
+  if (params.hasUnit) score += 0.12;
+  if (params.hasRange) score += 0.12;
+  if (params.cleanRow) score += 0.08;
+  if (params.reconstructed) score -= 0.04;
+  if (params.multipleRanges) score -= 0.1;
+  if (params.qualified) score -= 0.1;
 
-  let score = 0.45;
-
-  if (metricRecognized) {
-    score += 0.15;
-  }
-
-  if (hasUnit) {
-    score += 0.12;
-  }
-
-  if (hasRange) {
-    score += 0.12;
-  }
-
-  if (cleanRow) {
-    score += 0.08;
-  }
-
-  if (reconstructed) {
-    score -= 0.04;
-  }
-
-  /**
-   * Deliberately cap below 1.0.
-   *
-   * Even a clean OCR extraction is not guaranteed to be medically
-   * correct because OCR itself can misread characters.
-   */
-  return Math.max(
-    0,
-    Math.min(0.95, Number(score.toFixed(2)))
-  );
+  /* Capped below 1: OCR can always misread a digit. */
+  return Math.max(0, Math.min(0.95, Number(score.toFixed(2))));
 }
 
 // ============================================================
-// ROW PARSING
+// METRIC DETECTION IN A LINE
 // ============================================================
 
-function parseMetricRow(
-  metric: string,
-  remainingText: string,
-  options: {
-    cleanRow: boolean;
-    reconstructed: boolean;
+interface MetricSpan extends Span {
+  canonical: string;
+  matched: string;
+}
+
+function findMetrics(line: string): MetricSpan[] {
+  const spans: MetricSpan[] = [];
+
+  for (const match of line.matchAll(METRIC_REGEX)) {
+    const canonical = ALIAS_TO_CANONICAL.get(aliasKey(match[0]));
+    if (!canonical) continue;
+
+    const start = match.index ?? 0;
+    spans.push({ start, end: start + match[0].length, canonical, matched: match[0] });
   }
+
+  return spans;
+}
+
+function isAcceptablePrefix(prefix: string): boolean {
+  const trimmed = prefix.trim();
+  if (!trimmed) return true;
+
+  if (trimmed.length > MAX_PREFIX_CHARS) return false;
+
+  const tokens = trimmed.split(/\s+/);
+  if (tokens.length > MAX_PREFIX_TOKENS) return false;
+
+  return !tokens.some((token) => QUALIFIER_DENY.has(token.toLowerCase().replace(/[^a-z]/g, "")));
+}
+
+function looksLikeProse(line: string): boolean {
+  if (PROSE_CUE_REGEX.test(line)) return true;
+
+  const words = line.match(/[A-Za-z]{3,}/g);
+  return (words?.length ?? 0) > MAX_PROSE_WORDS;
+}
+
+function isHeaderLine(line: string): boolean {
+  if (/\d/.test(line)) return false;
+
+  let hits = 0;
+
+  for (const regex of HEADER_TERM_REGEXES) {
+    if (regex.test(line) && ++hits >= 2) return true;
+  }
+
+  return false;
+}
+
+function cleanSegment(segment: string): string {
+  return segment.replace(/^[\s:;,|*\-]+/, "").trim();
+}
+
+// ============================================================
+// SEGMENT -> LabMetric
+// ============================================================
+
+function buildMetric(
+  span: MetricSpan,
+  rest: string,
+  context: { cleanRow: boolean; reconstructed: boolean }
 ): LabMetric | null {
-  const cleaned = normalizeWhitespace(remainingText);
+  const analysis = analyzeRest(cleanSegment(rest));
 
-  if (!cleaned) {
-    return null;
+  if (!analysis.value) return null;
+
+  /* Result must sit right next to the name; long gaps mean prose or a different test. */
+  if (analysis.gapWords.length > MAX_VALUE_GAP_WORDS) return null;
+  if (analysis.gapWords.some((word) => QUALIFIER_DENY.has(word))) return null;
+
+  const hasUnit = analysis.unit !== NOT_SPECIFIED;
+  const hasRange = analysis.ranges.length > 0;
+
+  /* "TSH 2021" with no unit and no range is far more likely a year or an ID than a result. */
+  const isShortAlias = span.matched.replace(/\s+/g, "").length <= SHORT_ALIAS_LENGTH;
+  if (isShortAlias && !hasUnit && !hasRange) return null;
+
+  /* "Neutrophils 2.9 10^3/µL" is the ABSOLUTE count; "Neutrophils 60 %" is the percentage. */
+  let canonical = span.canonical;
+  if (ABSOLUTE_COUNT_NAMES[canonical] && hasUnit && analysis.unit !== "%") {
+    canonical = ABSOLUTE_COUNT_NAMES[canonical];
   }
 
-  const value = extractResultValue(cleaned);
-
-  /**
-   * Preserve numeric results even if OCR missed the unit or range.
-   */
-  if (!value) {
-    return null;
-  }
-
-  const unitMatch = extractUnit(cleaned);
-  const rangeMatch = extractRange(cleaned);
-
-  const unit = unitMatch
-    ? normalizeUnit(unitMatch.value)
-    : "Not specified";
-
-  const referenceRange = rangeMatch
-    ? normalizeRange(rangeMatch.value)
-    : "Not specified";
-
-  const flag = calculateFlag(
-    value,
-    referenceRange
-  );
-
-  const confidence = calculateConfidence({
-    hasValue: Boolean(value),
-    hasUnit: unit !== "Not specified",
-    hasRange: referenceRange !== "Not specified",
-    metricRecognized: true,
-    cleanRow: options.cleanRow,
-    reconstructed: options.reconstructed,
-  });
+  const referenceRange = hasRange
+    ? analysis.ranges.map((range) => range.text).join(" / ")
+    : NOT_SPECIFIED;
 
   return {
-    metric: canonicalMetricName(metric),
-    value,
-    unit,
+    metric: canonical,
+    value: analysis.value,
+    unit: analysis.unit,
     range: referenceRange,
     referenceRange,
-    flag,
-    confidence,
+    flag: computeFlag(analysis.value, analysis.ranges, analysis.hasQualifier),
+    confidence: computeConfidence({
+      hasUnit,
+      hasRange,
+      cleanRow: context.cleanRow,
+      reconstructed: context.reconstructed,
+      multipleRanges: analysis.ranges.length > 1,
+      qualified: analysis.hasQualifier,
+    }),
   };
 }
 
+function parseLine(line: string, reconstructed: boolean): LabMetric[] {
+  if (looksLikeProse(line)) return [];
+
+  const spans = findMetrics(line);
+  if (spans.length === 0) return [];
+
+  const prefix = line.slice(0, spans[0].start);
+  const prefixOk = isAcceptablePrefix(prefix);
+  const cleanRow = prefix.trim() === "" && !reconstructed;
+
+  const metrics: LabMetric[] = [];
+
+  spans.forEach((span, index) => {
+    if (index === 0 && !prefixOk) return;
+
+    const next = spans[index + 1];
+    const rest = line.slice(span.end, next ? next.start : line.length);
+
+    const metric = buildMetric(span, rest, { cleanRow, reconstructed });
+    if (metric) metrics.push(metric);
+  });
+
+  return metrics;
+}
+
 // ============================================================
-// ROW RECONSTRUCTION
+// ROW RECONSTRUCTION (wrapped OCR lines)
 // ============================================================
 
-interface ReconstructedRow {
+interface Row {
   text: string;
   reconstructed: boolean;
 }
 
-/**
- * Detect whether a line looks like a continuation of a laboratory row.
- *
- * We deliberately DO NOT use a generic "line.length < 80" rule.
- *
- * That rule can incorrectly merge unrelated OCR text such as:
- * - patient information
- * - comments
- * - footnotes
- * - headings
- *
- * A continuation line must contain something structurally useful:
- * numeric value, unit, or reference range.
- */
 function isUsefulContinuationLine(line: string): boolean {
-  return (
-    extractNumbers(line).length > 0 ||
-    Boolean(extractUnit(line)) ||
-    Boolean(extractRange(line))
-  );
+  return /\d/.test(line) || UNIT_PROBE_REGEX.test(line);
 }
 
-function reconstructRows(
-  lines: string[]
-): ReconstructedRow[] {
-  const rows: ReconstructedRow[] = [];
+/** A row with value + unit + range needs no more lines. */
+function isRowComplete(rowText: string): boolean {
+  const spans = findMetrics(rowText);
+  if (spans.length === 0) return false;
 
-  let currentRow = "";
-  let currentWasReconstructed = false;
+  const next = spans[1];
+  const analysis = analyzeRest(cleanSegment(rowText.slice(spans[0].end, next ? next.start : undefined)));
 
-  for (const originalLine of lines) {
-    const line = normalizeWhitespace(originalLine);
+  return Boolean(analysis.value) && analysis.unit !== NOT_SPECIFIED && analysis.ranges.length > 0;
+}
 
-    if (!line) {
+function buildRows(lines: string[]): Row[] {
+  const rows: Row[] = [];
+
+  let current = "";
+  let merged = 0;
+
+  const flush = () => {
+    if (current) rows.push({ text: current, reconstructed: merged > 0 });
+    current = "";
+    merged = 0;
+  };
+
+  for (const line of lines) {
+    if (isHeaderLine(line)) {
+      flush();
       continue;
     }
 
-    const metricAtStart = findMetricInLine(line);
-
-    /**
-     * New metric row.
-     */
-    if (metricAtStart) {
-      if (currentRow) {
-        rows.push({
-          text: currentRow,
-          reconstructed: currentWasReconstructed,
-        });
-      }
-
-      currentRow = line;
-      currentWasReconstructed = false;
+    if (findMetrics(line).length > 0) {
+      flush();
+      current = line;
       continue;
     }
 
-    /**
-     * No current row:
-     * preserve it for the "metric anywhere" pass later.
-     */
-    if (!currentRow) {
-      rows.push({
-        text: line,
-        reconstructed: false,
-      });
+    const canMerge =
+      current !== "" &&
+      merged < MAX_CONTINUATION_LINES &&
+      !NOISE_LINE_REGEX.test(line) &&
+      isUsefulContinuationLine(line) &&
+      !isRowComplete(current);
 
+    if (canMerge) {
+      current = `${current} ${line}`;
+      merged += 1;
       continue;
     }
 
-    /**
-     * Merge only structurally useful continuation lines.
-     */
-    if (isUsefulContinuationLine(line)) {
-      currentRow = `${currentRow} ${line}`;
-      currentWasReconstructed = true;
-      continue;
-    }
-
-    /**
-     * A new non-metric line without useful numeric/table structure
-     * should not be blindly merged into the laboratory row.
-     */
-    rows.push({
-      text: currentRow,
-      reconstructed: currentWasReconstructed,
-    });
-
-    rows.push({
-      text: line,
-      reconstructed: false,
-    });
-
-    currentRow = "";
-    currentWasReconstructed = false;
+    flush();
   }
 
-  if (currentRow) {
-    rows.push({
-      text: currentRow,
-      reconstructed: currentWasReconstructed,
-    });
-  }
+  flush();
 
   return rows;
 }
 
 // ============================================================
-// DUPLICATE HANDLING
+// DE-DUPLICATION
 // ============================================================
 
-function completenessScore(metric: LabMetric): number {
+function completeness(metric: LabMetric): number {
   return (
-    (metric.value !== "Not specified" ? 1 : 0) +
-    (metric.unit !== "Not specified" ? 1 : 0) +
-    (metric.referenceRange !== "Not specified" ? 1 : 0)
+    (metric.unit !== NOT_SPECIFIED ? 1 : 0) +
+    (metric.referenceRange !== NOT_SPECIFIED ? 1 : 0) +
+    (metric.flag !== "N/A" ? 1 : 0)
   );
 }
 
-function mergeDuplicateMetric(
-  existing: LabMetric,
-  incoming: LabMetric
-): LabMetric {
-  const existingCompleteness =
-    completenessScore(existing);
+/** Keep the more complete extraction; ties go to higher confidence, then to the first one seen. */
+function pickBetter(existing: LabMetric, incoming: LabMetric): LabMetric {
+  const diff = completeness(incoming) - completeness(existing);
+  if (diff !== 0) return diff > 0 ? incoming : existing;
 
-  const incomingCompleteness =
-    completenessScore(incoming);
+  return incoming.confidence > existing.confidence ? incoming : existing;
+}
 
-  /**
-   * Prefer a more complete extraction.
-   */
-  if (incomingCompleteness > existingCompleteness) {
-    return incoming;
+function deduplicate(metrics: LabMetric[]): LabMetric[] {
+  const byName = new Map<string, LabMetric>();
+
+  for (const metric of metrics) {
+    const key = metric.metric.toLowerCase();
+    const existing = byName.get(key);
+
+    byName.set(key, existing ? pickBetter(existing, metric) : metric);
   }
 
-  if (existingCompleteness > incomingCompleteness) {
-    return existing;
-  }
-
-  /**
-   * If equally complete, prefer higher extraction confidence.
-   */
-  if (incoming.confidence > existing.confidence) {
-    return incoming;
-  }
-
-  /**
-   * If equally confident, keep the first stable result.
-   *
-   * We intentionally do not merge two conflicting numeric values.
-   * A downstream medical layer should never receive an invented
-   * combination of conflicting OCR values.
-   */
-  return existing;
+  return [...byName.values()];
 }
 
 // ============================================================
-// INPUT NORMALIZATION
+// INPUT PREPARATION + PUBLIC API
 // ============================================================
 
-function prepareInput(text: string): string[] {
-  const normalizedText = normalizeOCRText(text)
-    .slice(0, MAX_OCR_TEXT_LENGTH);
-
-  return normalizedText
+function prepareLines(text: string): string[] {
+  return normalizeOCRText(text.slice(0, MAX_OCR_TEXT_LENGTH))
     .split("\n")
-    .map(line => normalizeWhitespace(line))
+    .map((line) => normalizeWhitespace(line).slice(0, MAX_LINE_LENGTH))
     .filter(Boolean)
     .slice(0, MAX_LINES);
 }
 
-// ============================================================
-// MAIN PARSER
-// ============================================================
-
 export function parseLabTable(text: string): LabMetric[] {
-  if (typeof text !== "string" || !text.trim()) {
-    return [];
-  }
+  if (typeof text !== "string" || !text.trim()) return [];
 
-  /**
-   * Defense-in-depth input limit.
-   */
-  if (text.length > MAX_OCR_TEXT_LENGTH) {
-    text = text.slice(0, MAX_OCR_TEXT_LENGTH);
-  }
+  const rows = buildRows(prepareLines(text));
 
-  const rawLines = prepareInput(text);
-
-  if (rawLines.length === 0) {
-    return [];
-  }
-
-  const rows = reconstructRows(rawLines);
-
-  const results: LabMetric[] = [];
-
-  for (const row of rows) {
-    const line = row.text;
-
-    if (!line || isHeaderLine(line)) {
-      continue;
-    }
-
-    /**
-     * ----------------------------------------------------------
-     * PASS 1: metric at beginning of row
-     * ----------------------------------------------------------
-     *
-     * Example:
-     *
-     * Haemoglobin 15 g/dL 13-17
-     */
-    const startMetric = findMetricInLine(line);
-
-    if (startMetric) {
-      const remaining = line
-        .slice(startMetric.length)
-        .replace(/^[\s:;,|*\-]+/, "")
-        .trim();
-
-      const parsed = parseMetricRow(
-        startMetric.metric,
-        remaining,
-        {
-          cleanRow: !row.reconstructed,
-          reconstructed: row.reconstructed,
-        }
-      );
-
-      if (parsed) {
-        results.push(parsed);
-        continue;
-      }
-    }
-
-    /**
-     * ----------------------------------------------------------
-     * PASS 2: metric somewhere inside row
-     * ----------------------------------------------------------
-     *
-     * Handles OCR such as:
-     *
-     * CBC Haemoglobin 15 g/dL 13-17
-     *
-     * or:
-     *
-     * Test Haemoglobin 15 g/dL 13-17
-     */
-    const anywhereMetric = findMetricAnywhere(line);
-
-    if (!anywhereMetric) {
-      continue;
-    }
-
-    const remaining = line
-      .slice(
-        anywhereMetric.index +
-          anywhereMetric.length
-      )
-      .replace(/^[\s:;,|*\-]+/, "")
-      .trim();
-
-    const parsed = parseMetricRow(
-      anywhereMetric.metric,
-      remaining,
-      {
-        cleanRow: false,
-        reconstructed: row.reconstructed,
-      }
-    );
-
-    if (parsed) {
-      results.push(parsed);
-    }
-  }
-
-  /**
-   * ----------------------------------------------------------
-   * DEDUPLICATION
-   * ----------------------------------------------------------
-   *
-   * Keep one deterministic result per canonical metric.
-   */
-  const deduplicated = new Map<
-    string,
-    LabMetric
-  >();
-
-  for (const metric of results) {
-    const key = metric.metric.toLowerCase();
-
-    const existing = deduplicated.get(key);
-
-    if (!existing) {
-      deduplicated.set(key, metric);
-      continue;
-    }
-
-    deduplicated.set(
-      key,
-      mergeDuplicateMetric(existing, metric)
-    );
-  }
-
-  return Array.from(
-    deduplicated.values()
-  );
+  return deduplicate(rows.flatMap((row) => parseLine(row.text, row.reconstructed)));
 }
 
-// ============================================================
-// DEVELOPMENT DEBUG HELPER
-// ============================================================
-
 /**
- * Development/debug helper.
- *
- * IMPORTANT:
- * Do not expose this directly through a production endpoint because
- * OCR input can contain sensitive health information.
+ * Development helper. Disabled in production because OCR text can contain sensitive health data.
  */
-export function debugParseLabTable(
-  text: string
-): {
-  rows: string[];
-  metrics: LabMetric[];
-} {
-  if (typeof text !== "string") {
-    return {
-      rows: [],
-      metrics: [],
-    };
+export function debugParseLabTable(text: string): { rows: string[]; metrics: LabMetric[] } {
+  if (process.env.NODE_ENV === "production" || typeof text !== "string") {
+    return { rows: [], metrics: [] };
   }
 
-  const lines = prepareInput(text);
-
-  const rows = reconstructRows(lines);
-
   return {
-    rows: rows.map(row => row.text),
+    rows: buildRows(prepareLines(text)).map((row) => row.text),
     metrics: parseLabTable(text),
   };
 }
