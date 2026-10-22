@@ -423,38 +423,47 @@ export default function SymptomChecker() {
         ))}
       </div>
 
-      <div className="mt-6 flex flex-wrap items-center justify-center gap-2">
-        <Button variant="ghost" size="sm" onClick={() => setShowProfile((v) => !v)} aria-expanded={showProfile}>
-          <UserCog className="mr-2 h-4 w-4" />
-          {hasProfile(profile) ? "Edit my health profile" : "Personalise with my health profile"}
-        </Button>
-        <Button
-          variant="ghost"
-          size="sm"
-          onClick={() => {
-            const v = !historyOn;
-            setHistoryOn(v);
-            setHistoryConsent(v);
-          }}
-        >
-          {historyOn ? "Forget my recent check-ins" : "Remember my recent check-ins"}
-        </Button>
-        <div className="flex gap-1">
-          {LOCALES.map((l) => (
-            <button
-              key={l.id}
-              type="button"
-              onClick={() => {
-                setLang(l.id);
-                saveLocale(l.id);
-              }}
-              className={cn(
-                "rounded-full border px-2.5 py-1 text-xs",
-                lang === l.id ? "border-primary bg-primary/10 text-primary" : "text-muted-foreground hover:border-primary"
-              )}
-            >
-              {l.label}
-            </button>
+      <div className="mx-auto mt-8 flex max-w-2xl flex-col items-center gap-4 sm:flex-row sm:flex-wrap sm:justify-center sm:gap-x-6 sm:gap-y-3">
+  <Button variant="ghost" size="sm" onClick={() => setShowProfile((v) => !v)} aria-expanded={showProfile}>
+    <UserCog className="mr-2 h-4 w-4" />
+    {hasProfile(profile) ? "Edit my health profile" : "Personalise with my health profile"}
+  </Button>
+
+  <span className="hidden h-4 w-px bg-border sm:block" aria-hidden="true" />
+
+  <Button
+    variant="ghost"
+    size="sm"
+    onClick={() => {
+      const v = !historyOn;
+      setHistoryOn(v);
+      setHistoryConsent(v);
+    }}
+  >
+    {historyOn ? "Forget my recent check-ins" : "Remember my recent check-ins"}
+  </Button>
+
+  <span className="hidden h-4 w-px bg-border sm:block" aria-hidden="true" />
+
+  <div className="flex items-center gap-1.5">
+    <span className="text-xs text-muted-foreground">Language:</span>
+    {LOCALES.map((l) => (
+      <button
+        key={l.id}
+        type="button"
+        onClick={() => {
+          setLang(l.id);
+          saveLocale(l.id);
+        }}
+        className={cn(
+          "rounded-full border px-2.5 py-1 text-xs transition-colors",
+          lang === l.id
+            ? "border-primary bg-primary/10 font-medium text-primary"
+            : "text-muted-foreground hover:border-primary hover:text-foreground"
+        )}
+      >
+        {l.label}
+      </button>
           ))}
         </div>
       </div>
