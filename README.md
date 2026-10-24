@@ -8,7 +8,9 @@
 
 ![My Health App screenshot](docs/My-Health-App.png)
 
-· [60-second walkthrough]
+
+[Live Link: https://my-health-app-drab.vercel.app/]
+
 
 ![Demo](docs/demo.gif)
 
