@@ -6,7 +6,7 @@
 [![CI](https://github.com/chirag902/My-Health-App/actions/workflows/ci.yml/badge.svg)](https://github.com/chirag902/My-Health-App/actions/workflows/ci.yml)
 
 
-[Live Link: https://meaning-it.vercel.app/]
+[Live Link: https://my-health-app-drab.vercel.app/]
 
 
 ![Demo](docs/demo.gif)
