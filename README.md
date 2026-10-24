@@ -5,6 +5,9 @@
 **An AI health assistant that answers from its sources, or doesn't answer.**
 [![CI](https://github.com/chirag902/My-Health-App/actions/workflows/ci.yml/badge.svg)](https://github.com/chirag902/My-Health-App/actions/workflows/ci.yml)
 
+
+![My Health App screenshot](docs/My-Health-App.png)
+
 · [60-second walkthrough]
 
 ![Demo](docs/demo.gif)

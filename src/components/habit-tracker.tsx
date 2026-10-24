@@ -329,6 +329,7 @@ export default function HabitTracker() {
         setIsLoadingHabits(false);
       },
       (error: unknown) => {
+        
         const firebaseError = error as { code?: string; message?: string };
         if (firebaseError.code === "permission-denied") {
           errorEmitter.emit(
