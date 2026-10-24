@@ -1,0 +1,41 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isOwner(uid) {
+      return request.auth != null && request.auth.uid == uid;
+    }
+
+    match /users/{uid} {
+      allow read, write: if isOwner(uid);
+
+      match /habits/{id} {
+        allow read, write: if isOwner(uid);
+      }
+
+      match /journal/{id} {
+        allow read, write: if isOwner(uid);
+      }
+
+      match /motivation/{date} {
+        allow read, delete: if isOwner(uid);
+        allow create, update: if isOwner(uid)
+          && date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+          && request.resource.data.message is string
+          && request.resource.data.message.size() < 300
+          && request.resource.data.theme is string;
+      }
+
+      match /diagnosisFeedback/{id} {
+        allow read, delete: if isOwner(uid);
+        allow create: if isOwner(uid)
+          && request.resource.data.keys().hasOnly(['mode','urgency','helpful','urgencyRating','createdAt'])
+          && request.resource.data.mode in ['quick','detailed']
+          && request.resource.data.urgency in ['emergency','urgent','soon','routine','self-care']
+          && request.resource.data.urgencyRating in ['too_low','correct','too_high'];
+        allow update: if false;
+      }
+    }
+  }
+}

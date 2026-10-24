@@ -40,3 +40,4 @@ next-env.d.ts
 /public/pdf.worker.js.map
 
 .env
+firestore-debug.log
