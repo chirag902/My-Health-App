@@ -5,7 +5,9 @@
 **An AI health assistant that answers from its sources, or doesn't answer.**
 [![CI](https://github.com/chirag902/My-Health-App/actions/workflows/ci.yml/badge.svg)](https://github.com/chirag902/My-Health-App/actions/workflows/ci.yml)
 
-· [60-second walkthrough]
+
+[Live Link: https://meaning-it.vercel.app/]
+
 
 ![Demo](docs/demo.gif)
 
